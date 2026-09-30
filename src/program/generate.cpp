@@ -44,6 +44,11 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/request_stop.hpp"
+#include "strata/program/prefix_file.hpp"
+#include "strata/program/prefix_state.hpp"
+#include "strata/program/conversation_store.hpp"
+#include <filesystem>
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -262,11 +267,15 @@ struct Options {
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    std::string prompt_cache_policy = "balanced"; // sparse coverage; lru keeps the legacy policy
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
+    std::string prefix_cache_file; // optional persistent system-prefix cache; absent means no disk I/O
+    std::string conversation_cache_dir; // optional full positional + recurrent inactive branches
+    int64_t conversation_cache_mib = 8192, conversation_cache_slots = 4;
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
@@ -350,9 +359,14 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
+                 "  --prompt-cache-policy balanced|lru  checkpoint retention (default balanced)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prefix-cache-file PATH  opt-in persistent system prefix (resident INT8 KV; up to 8 variants)\n"
+                 "  --conversation-cache-dir DIR  opt-in private SSD backing for inactive text conversations\n"
+                 "  --conversation-cache-mib N    total disk budget (default 8192; max 65536)\n"
+                 "  --conversation-cache-slots N  disk branches (default 4; max 64); one active GPU branch\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -921,8 +935,26 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--prompt-cache-policy") {
+            o.prompt_cache_policy = next("--prompt-cache-policy");
+            if (o.prompt_cache_policy != "balanced" && o.prompt_cache_policy != "lru") {
+                std::fprintf(stderr, "strata generate: --prompt-cache-policy must be balanced or lru\n");
+                return 2;
+            }
+        }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+        else if (a == "--prefix-cache-file") o.prefix_cache_file = next("--prefix-cache-file");
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots") {
+            int64_t value=0;
+            if (!strata::program::logits_selection::parse_stride(next(a.c_str()),value) ||
+                value>(a=="--conversation-cache-mib"?65536:64)) {
+                std::fprintf(stderr,"%s requires a positive integer within its limit\n",a.c_str());return 2;
+            }
+            if (a=="--conversation-cache-mib") o.conversation_cache_mib=value;
+            else o.conversation_cache_slots=value;
+        }
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -2490,35 +2522,143 @@ int main(int argc, char** argv) {
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
+        int64_t cache_anchor = 0;  // a learned exact fork boundary, only a retention hint
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
-        int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        int64_t pp_total = 0, pp_from = 0, pp_done = 0, pp_root_end = 0;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
             return v;
         };
+        // Disk snapshots are an optional backing store, not a replacement for the live prefix chain.
+        struct DiskPrefix { std::string path; strata::program::PrefixFile meta; };
+        std::vector<DiskPrefix> disk_prefixes;
+        std::set<uint64_t> disk_attempted;
+        std::string disk_identity;
+        strata::program::ConversationStore conversations;
+        const bool conversation_cache = !o.conversation_cache_dir.empty();
+        if (!o.prefix_cache_file.empty() || conversation_cache) {
+            if (o.kv != "int8" || o.kv_resident != 0 || o.prompt_cache < 1 || o.prompt_cache_root < 1 ||
+                o.mtp.empty() || !o.cvec_files.empty() || o.vision) {
+                std::fprintf(stderr, "strata disk cache: requires resident INT8 KV, MTP, prompt cache/root; no vision/control vectors\n");
+                return 1;
+            }
+            try {
+                std::ostringstream key;
+                key << "prefix-v1|" << __DATE__ << '|' << __TIME__ << "|slots=" << xcache.slots();
+                if (std::filesystem::exists("/proc/self/exe"))
+                    key << "|exe=" << std::filesystem::file_size("/proc/self/exe") << ':'
+                        << std::filesystem::last_write_time("/proc/self/exe").time_since_epoch().count();
+                for (int i=1;i<argc;++i) {
+                    const std::string arg=argv[i];
+                    if (arg=="--prefix-cache-file" || arg=="--conversation-cache-dir" ||
+                        arg=="--conversation-cache-mib" || arg=="--conversation-cache-slots") {++i;continue;}
+                    key << '|' << argv[i];
+                }
+                std::set<std::string> files = {o.pack+"/dense.bin", o.pack+"/experts.bin", o.pack+"/index.txt",
+                    o.pack+"/native_experts.txt", o.mtp+"/dense.bin", o.mtp+"/dense.txt", o.mtp+"/experts.bin",
+                    o.mtp+"/draft_vocab.bin", o.native_preset, o.native_head_gguf, o.ple_gguf, o.expert_profile};
+                for (const auto& f:o.native_dense_gguf) files.insert(f);
+                for (const auto& f:files) if (!f.empty() && std::filesystem::is_regular_file(f))
+                    key << '|' << std::filesystem::absolute(f).string() << ':' << std::filesystem::file_size(f)
+                        << ':' << std::filesystem::last_write_time(f).time_since_epoch().count();
+                disk_identity=key.str();
+                const std::filesystem::path base=std::filesystem::absolute(o.prefix_cache_file.empty()?".":o.prefix_cache_file);
+                if (!o.prefix_cache_file.empty() && std::filesystem::exists(base.parent_path())) {
+                    for (const auto& e:std::filesystem::directory_iterator(base.parent_path())) {
+                        const auto name=e.path().filename().string(), stem=base.filename().string();
+                        if (name!=stem && !(name.rfind(stem+".",0)==0 && e.path().extension()==".bin")) continue;
+                        strata::program::PrefixFile meta; std::string why;
+                        if (strata::program::prefix_read(e.path().string(),meta,true,why) && meta.identity==disk_identity)
+                            disk_prefixes.push_back({e.path().string(),std::move(meta)});
+                        if (disk_prefixes.size()>=8) break;
+                    }
+                }
+                std::fprintf(stderr,"strata prefix cache: indexed %zu compatible disk variants\n",disk_prefixes.size());
+                if (conversation_cache) {
+                    std::string why;
+                    if (!conversations.open(o.conversation_cache_dir,"conversation-v1|"+disk_identity,
+                            (size_t)o.conversation_cache_slots,(uint64_t)o.conversation_cache_mib<<20,why))
+                        throw std::runtime_error(why);
+                    std::fprintf(stderr,"strata conversation cache: indexed %zu branches, %llu MiB, limit=%lld MiB/%lld slots\n",
+                        conversations.size(),(unsigned long long)(conversations.bytes()>>20),
+                        (long long)o.conversation_cache_mib,(long long)o.conversation_cache_slots);
+                }
+            } catch(const std::exception& e) {
+                std::fprintf(stderr,"strata prefix cache: initialization failed: %s\n",e.what()); return 1;
+            }
+        }
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         auto checkpoint_at = [&](int64_t L) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
+            if ((int) checks.size() >= o.prompt_cache) {
+                // Decide on metadata BEFORE copying ~118 MB. Recycle the victim's buffers so
+                // a full cache does not temporarily allocate an extra checkpoint every 2048 tokens.
+                std::vector<int64_t> positions;
+                std::vector<uint64_t> stamps;
+                size_t prefix_count = 0;
+                for (const ConvCheckpoint& k : checks) {
+                    positions.push_back((int64_t) k.ids.size()); stamps.push_back(k.used);
+                    if ((int64_t) k.ids.size() <= pp_root_end) ++prefix_count;
+                }
+                positions.push_back(L); stamps.push_back(check_clock + 1);
+                if (L <= pp_root_end) ++prefix_count;
+                const size_t victim = o.prompt_cache_policy == "balanced"
+                    ? strata::program::conv_cache::balanced_eviction_victim(positions, o.prompt_cache,
+                                                                           pp_root_end, cache_anchor)
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+                                                                  o.prompt_cache, prefix_count);
+                if (victim == checks.size()) return true;
+                c = std::move(checks[victim]);
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+            }
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
             c.used = ++check_clock;
             checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) {
-                std::vector<uint64_t> stamps;
-                stamps.reserve(checks.size());
-                for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
-                                                                                   o.prompt_cache);
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
-            }
+            std::fprintf(stderr, "strata serve: checkpoint saved position=%lld system_end=%lld retained=%zu\n",
+                         (long long) L, (long long) pp_root_end, checks.size());
             return true;
+        };
+        auto persist_system = [&](int64_t L) {
+            if (o.prefix_cache_file.empty() || !req_imgs.empty() || L<1 || disk_prefixes.size()>=8 ||
+                !strata::program::prefix_is_system(cur)) return;
+            strata::program::PrefixFile f;
+            f.identity=disk_identity;
+            f.tokens.assign(cur.begin(),cur.begin()+L);
+            for (const auto& entry:disk_prefixes) if (entry.meta.tokens==f.tokens) return;
+            const uint64_t hash=strata::program::prefix_hash(f.tokens.data(),f.tokens.size()*4) ^
+                                strata::program::prefix_hash(disk_identity.data(),disk_identity.size());
+            if (!disk_attempted.insert(hash).second) return;
+            for (const auto& c:checks) if ((int64_t)c.ids.size()<=L) {
+                f.positions.push_back(c.ids.size());
+                f.blobs.push_back(c.gdn); f.blobs.push_back(c.ple); f.blobs.push_back(c.tails);
+            }
+            std::string why;
+            if (f.positions.empty() || f.positions.back()!=(uint64_t)L ||
+                !strata::program::prefix_state_capture(ss,g,mtp,L,f.blobs,why)) {
+                std::fprintf(stderr,"strata prefix cache: capture skipped: %s\n",why.c_str());return;
+            }
+            std::string path=o.prefix_cache_file;
+            std::error_code path_error;
+            const bool exists=std::filesystem::exists(path,path_error);
+            if (path_error) {
+                std::fprintf(stderr,"strata prefix cache: save skipped: %s\n",path_error.message().c_str());return;
+            }
+            if (exists) path+="."+std::to_string(hash)+".bin";
+            if (!strata::program::prefix_write(path,f,why)) {
+                std::fprintf(stderr,"strata prefix cache: save skipped: %s\n",why.c_str());return;
+            }
+            f.blobs.clear();
+            disk_prefixes.push_back({path,std::move(f)});
+            std::fprintf(stderr,"strata prefix cache: saved %lld system tokens, %zu checkpoints -> %s\n",
+                         (long long)L,disk_prefixes.back().meta.positions.size(),path.c_str());
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
@@ -2526,16 +2666,13 @@ int main(int argc, char** argv) {
             if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
+            pp_done = done;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            if (o.prompt_cache_every > 0 && done >= pp_next_check) {
-                if (!checkpoint_at(done)) { e = "saving a conversation checkpoint failed"; return false; }
-                pp_next_check = done + o.prompt_cache_every;
-            }
             return true;
         };
         drive.d.plan = ver.plan_sink();
@@ -2602,11 +2739,13 @@ int main(int argc, char** argv) {
             return true;
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
-        // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-        std::atomic<bool> stop_req{false};
+        // away, or pressed Esc): check between prompt layers/chunks and verify windows.
+        strata::program::RequestStop stop_req;
+        uint64_t request_ticket = stop_req.ticket();
+        auto stop_requested = [&] { return stop_req.requested(request_ticket); };
         std::mutex in_mu;
         std::condition_variable in_cv;
-        std::deque<std::string> in_lines;
+        std::deque<std::pair<std::string, uint64_t>> in_lines;
         bool in_eof = false;
         std::thread([&] {
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
@@ -2639,9 +2778,9 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
+                if (l == "STOP") { stop_req.signal(); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
-                in_lines.push_back(l);
+                in_lines.emplace_back(l, stop_req.ticket());
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
@@ -2652,11 +2791,73 @@ int main(int argc, char** argv) {
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
+            out = std::move(in_lines.front().first);
+            request_ticket = in_lines.front().second;
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        sp.should_stop = stop_requested;
+
+        // Save only before a destructive rewind/switch, never on the live append fast path.
+        // Capture through the deepest PREFILL checkpoint: final decode windows may not have
+        // populated all MTP cells. The last generated reply is deliberately re-read on return.
+        auto save_conversation = [&](const std::string& protected_path) {
+            if (!conversation_cache || checks.empty() || stop_requested()) return;
+            for (const auto& c:checks) if (!c.imgs.empty()) return;
+            if (conversations.contains(checks.back().ids)) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: identical snapshot already stored\n");
+                return;
+            }
+            const auto start=Clock::now();
+            strata::program::PrefixFile f;
+            f.identity="conversation-v1|"+disk_identity;f.tokens=checks.back().ids;
+            const uint64_t limit=std::min(strata::program::kConversationMaxBytes,
+                                          (uint64_t)o.conversation_cache_mib<<20);
+            uint64_t recurrent_bytes=0;
+            for (const auto& c:checks) recurrent_bytes+=c.gdn.size()+c.ple.size()+c.tails.size();
+            // Leave room for file metadata and bound temporary staging in addition to resident checkpoints.
+            if (limit<4*1024*1024 || recurrent_bytes>limit-4*1024*1024) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: staging budget\n");return;
+            }
+            for (const auto& c:checks) {
+                if (stop_requested()) return;
+                f.positions.push_back(c.ids.size());
+                f.blobs.push_back(c.gdn);f.blobs.push_back(c.ple);f.blobs.push_back(c.tails);
+            }
+            std::string why;
+            if (!strata::program::prefix_state_capture(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,why,
+                                                       stop_requested,limit-4*1024*1024) ||
+                !conversations.put(f,protected_path,why,stop_requested)) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: %s\n",why.c_str());return;
+            }
+            std::fprintf(stderr,"strata conversation cache: saved tokens=%zu checkpoints=%zu branches=%zu disk_mib=%llu evictions=%llu ms=%.0f\n",
+                f.tokens.size(),f.positions.size(),conversations.size(),(unsigned long long)(conversations.bytes()>>20),
+                (unsigned long long)conversations.evictions(),
+                std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+        };
+        auto snapshot_valid = [&](const strata::program::PrefixFile& f,const std::string& identity,std::string& why) {
+            const ConvStateSizes z=conv_state_sizes(g);
+            bool valid=f.identity==identity && !f.positions.empty() && f.positions.size()<=(size_t)o.prompt_cache &&
+                !f.tokens.empty() && f.positions.back()==f.tokens.size() && f.blobs.size()>=f.positions.size()*3;
+            for (size_t i=0;valid && i<f.positions.size();++i)
+                valid=f.blobs[3*i].size()==z.gdn && f.blobs[3*i+1].size()==(ss.ple_hist?z.ple:0) &&
+                      f.blobs[3*i+2].size()==z.tail*(size_t)g.n_qsa_layers();
+            if (!valid) {why="snapshot identity or recurrent dimensions mismatch";return false;}
+            return strata::program::prefix_state_validate(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,3*f.positions.size(),why);
+        };
+        auto restore_snapshot = [&](strata::program::PrefixFile& f,int64_t at,std::string& why) {
+            strata::core::session_zero(ss,g,nullptr,main_cs);
+            cudaStreamSynchronize(main_stream);
+            if (!strata::program::prefix_state_restore(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,3*f.positions.size(),why))
+                return false;
+            checks.clear();live_ok=false;
+            for (size_t i=0;i<f.positions.size();++i) if ((int64_t)f.positions[i]<=at) {
+                ConvCheckpoint c;c.ids.assign(f.tokens.begin(),f.tokens.begin()+f.positions[i]);
+                c.gdn=std::move(f.blobs[3*i]);c.ple=std::move(f.blobs[3*i+1]);c.tails=std::move(f.blobs[3*i+2]);
+                c.used=++check_clock;checks.push_back(std::move(c));
+            }
+            return true; // normal checkpoint_restore below restores the recurrence at `at`.
+        };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -2746,7 +2947,6 @@ int main(int argc, char** argv) {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
-            stop_req.store(false);   // a STOP that arrived between requests is stale
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -2900,11 +3100,7 @@ int main(int argc, char** argv) {
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
-            auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
-                const int64_t L = (int64_t) pre.size();
-                if (L < 1 || L > n - 1) return false;
-                for (int64_t i = 0; i < L; ++i)
-                    if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+            auto image_match = [&](int64_t L, const std::vector<ImgKey>& pre_imgs) -> bool {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             // the control vector for this request.  The live session and the checkpoints were read one way, so a
@@ -2918,20 +3114,129 @@ int main(int argc, char** argv) {
                 }
                 strata::kernels::cvec_set_enabled(want);
             }
+            int64_t checkpoint_common = checks.empty() ? 0 :
+                strata::program::conv_cache::common_prefix(checks.back().ids, ids);
+            const int64_t live_common = live_ok ? strata::program::conv_cache::common_prefix(live, ids) : 0;
+            const int64_t previous_end = live_ok ? (int64_t) live.size() :
+                (checks.empty() ? 0 : (int64_t) checks.back().ids.size());
+            const int64_t previous_common = live_ok ? live_common : checkpoint_common;
+            auto checkpoint_matches = [&](const ConvCheckpoint& c) {
+                const int64_t L = (int64_t) c.ids.size();
+                return L > 0 && L < n && L <= checkpoint_common && image_match(L, c.imgs);
+            };
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0) {
-                if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+                if (live_ok && !live.empty() && (int64_t) live.size() < n &&
+                    live_common == (int64_t) live.size() && image_match(live_common, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+                    if ((int64_t) c.ids.size() > resume && checkpoint_matches(c)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
             }
+            // Select before spilling, so the incoming snapshot cannot be evicted by the outgoing one.
+            auto branch_hit=conversation_cache ? conversations.find(ids,resume) : strata::program::ConversationHit{};
+            const int64_t old_branch_end=checks.empty()?0:(int64_t)checks.back().ids.size();
+            const int64_t old_root_before=checks.empty()?0:(int64_t)checks.front().ids.size();
+            const int64_t common_before=checkpoint_common;
+            if (conversation_cache && resume<old_branch_end) save_conversation(branch_hit.path);
+            // A STOP during cache I/O leaves the previous GPU branch intact and releases the FIFO promptly.
+            auto finish_cache_cancel = [&] {
+                if (!conversation_cache || !stop_requested()) return false;
+                const double ms=std::chrono::duration<double,std::milli>(Clock::now()-r0).count();
+                std::fprintf(stderr,"strata conversation cache: cancelled before prefill; checkpoints preserved=%zu\n",checks.size());
+                std::printf("DONE 0 %lld %.1f 0 cancel 0 0 0 0 0\n",(long long)n,ms);std::fflush(stdout);return true;
+            };
+            if (finish_cache_cancel()) continue;
+            const char* restore_source=nullptr;
+            int64_t disk_common = 0;
+            if (branch_hit.position>resume) {
+                const auto start=Clock::now();
+                strata::program::PrefixFile f;std::string why;
+                if (conversations.load(branch_hit,f,why,stop_requested) &&
+                    snapshot_valid(f,"conversation-v1|"+disk_identity,why)) {
+                    if (!restore_snapshot(f,branch_hit.position,why)) {
+                        std::printf("ERR conversation cache CUDA restore failed: %s\n",why.c_str());return 1;
+                    }
+                    disk_common = strata::program::conv_cache::common_prefix(f.tokens, ids);
+                    resume=branch_hit.position;from_live=false;restore_source="conversation-disk";
+                    std::fprintf(stderr,"strata conversation cache: restored tokens=%lld ms=%.0f\n",(long long)resume,
+                        std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+                } else {
+                    if (why!="cancelled") conversations.discard(branch_hit.path);
+                    std::fprintf(stderr,"strata conversation cache: restore skipped: %s\n",why.c_str());
+                }
+            }
+            // A system-only disk match is used only when better than both RAM and a full branch.
+            if (!o.prefix_cache_file.empty() && req_imgs.empty() && !stop_requested()) {
+                size_t pick=disk_prefixes.size(); int64_t disk_resume=resume;
+                for (size_t i=0;i<disk_prefixes.size();++i) {
+                    const int64_t match=strata::program::prefix_match(disk_prefixes[i].meta,ids);
+                    if (match>disk_resume) {disk_resume=match;pick=i;}
+                }
+                if (pick<disk_prefixes.size()) {
+                    strata::program::PrefixFile f; std::string why;
+                    const bool valid=strata::program::prefix_read(disk_prefixes[pick].path,f,false,why) &&
+                        f.tokens==disk_prefixes[pick].meta.tokens && f.positions==disk_prefixes[pick].meta.positions &&
+                        snapshot_valid(f,disk_identity,why);
+                    if (!valid) {
+                        std::fprintf(stderr,"strata prefix cache: rejected snapshot (%s); normal prefill\n",why.c_str());
+                        disk_prefixes.erase(disk_prefixes.begin()+(std::ptrdiff_t)pick);
+                    } else {
+                        if (!restore_snapshot(f,disk_resume,why)) {
+                            std::printf("ERR prefix cache CUDA restore failed: %s\n",why.c_str());return 1;
+                        }
+                        disk_common = strata::program::conv_cache::common_prefix(f.tokens, ids);
+                        resume=disk_resume;from_live=false;restore_source="system-disk";
+                        std::fprintf(stderr,"strata prefix cache: restored %lld tokens from disk\n",(long long)resume);
+                    }
+                }
+            }
+            if (finish_cache_cancel()) continue;
+            if (conversation_cache) {
+                std::fprintf(stderr,"strata conversation cache: match=%lld old_branch=%lld common=%lld cause=%s\n",
+                    (long long)resume,(long long)old_branch_end,(long long)common_before,
+                    old_branch_end==0?"cold":common_before<old_root_before?"prefix-changed":
+                    common_before<old_branch_end?"conversation-fork":"append-or-tail");
+            }
+            if (restore_source) {
+                checkpoint_common = checks.empty() ? 0 :
+                    strata::program::conv_cache::common_prefix(checks.back().ids, ids);
+                cache_anchor = 0;
+            }
+            // Learn the exact common-prefix boundary after an edit/truncation. Replaying up to
+            // it reconstructs the recurrence correctly; never reuse state AFTER a changed token.
+            // Vision keeps the existing image-aware path (token-only LCP is not sufficient there).
+            int64_t fork_at = -1;
+            if (o.prompt_cache > 0 && req_imgs.empty() && live_imgs.empty() &&
+                previous_common > 0 && previous_common < previous_end) {
+                cache_anchor = std::min<int64_t>(previous_common, n - 1);
+                if (cache_anchor > resume) fork_at = cache_anchor;
+            } else if (resume == 0 || cache_anchor > resume) {
+                cache_anchor = 0;
+            }
+            const int64_t common_tokens = std::max({resume, previous_common, checkpoint_common, disk_common});
+            const int64_t checkpoint_gap = std::max<int64_t>(0, std::min(common_tokens, n - 1) - resume);
+            const char* cache_source = restore_source ? restore_source :
+                resume == 0 ? "miss" : from_live ? "live" : "checkpoint";
+            std::fprintf(stderr, "strata serve: cache coverage: common=%lld replay_gap=%lld fork_at=%lld policy=%s\n",
+                         (long long) common_tokens, (long long) checkpoint_gap, (long long) fork_at,
+                         o.prompt_cache_policy.c_str());
+            // Diagnostics without logging prompt text. Checkpoints share one positional KV branch:
+            // pinning the root against LRU does not make a different root safe to reuse.
+            int64_t root_common = 0;
+            const int64_t old_root = checks.empty() ? 0 : (int64_t) checks.front().ids.size();
+            if (!checks.empty())
+                while (root_common < std::min(old_root, n) &&
+                       checks.front().ids[(size_t) root_common] == (int32_t) ids[(size_t) root_common]) ++root_common;
+            std::fprintf(stderr, "strata serve: prefix cache: reused=%lld source=%s old_root=%lld common_root=%lld checkpoints=%zu\n",
+                         (long long) resume, restore_source ? restore_source : resume == 0 ? "miss" : from_live ? "live" : "checkpoint",
+                         (long long) old_root, (long long) root_common, checks.size());
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                             return (int64_t) c.ids.size() > resume || !checkpoint_matches(c);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
@@ -2964,12 +3269,13 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
-            mtp.set_prompt_len(n);
+            // A persisted system must include ALL of its MTP cells, even when the first request has a long tail.
+            mtp.set_prompt_len(o.prefix_cache_file.empty() && !conversation_cache ? n : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             pp_total = n;
             pp_from = read_from;
+            pp_done = read_from;
             pp_t0 = r0;
-            pp_next_check = reread_to > 0 ? INT64_MAX : resume + o.prompt_cache_every;
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
@@ -2998,7 +3304,7 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 for (int64_t q = a; q < b;) {
-                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (stop_requested()) { e = "cancelled"; return false; }
                     const int T = (int) std::min<int64_t>(S, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
@@ -3013,6 +3319,7 @@ int main(int argc, char** argv) {
                     }
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
+                    pp_done = q;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
@@ -3098,14 +3405,18 @@ int main(int argc, char** argv) {
             // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
             // is cheaper to read again than the extra part costs (~0.3 s).
             int64_t root_at = -1;
-            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && read_from == 0)
-                for (int64_t i = 1; i < turn_at; ++i)
+            pp_root_end = 0;
+            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0)
+                for (int64_t i = 1; i < n - 1; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
-                        if (i >= o.prompt_cache_root) root_at = i;
+                        if (i >= o.prompt_cache_root) pp_root_end = i;
                         break;
                     }
+            if (pp_root_end > read_from) root_at = pp_root_end;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            const int64_t check_every = o.prompt_cache > 0 ? o.prompt_cache_every : 0;
+            for (const int64_t to : strata::program::conv_cache::read_boundaries(
+                     read_from, n - 1, root_at, turn_at, reread_to, check_every, fork_at)) {
                 if (to <= at) continue;
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -3125,7 +3436,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
                 if (!sp_ok) {
-                    if (!stop_req.load()) {
+                    if (!stop_requested()) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -3134,10 +3445,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == fork_at || (check_every > 0 && to % check_every == 0)) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
+                if (to==pp_root_end && !stop_requested()) persist_system(to);
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -3254,7 +3566,7 @@ int main(int argc, char** argv) {
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (stop_requested()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
@@ -3346,13 +3658,15 @@ int main(int argc, char** argv) {
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
-            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n, prompt_ms,
+            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups] [common] [replay gap] [source]
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %s\n", (long long) produced_n, (long long) n, prompt_ms,
                         decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume,
-                        (long long) req_hits, (long long) req_look);
+                        (long long) req_hits, (long long) req_look, (long long) common_tokens,
+                        (long long) checkpoint_gap, cache_source);
             std::fflush(stdout);
-            const int64_t fresh = n - resume;
-            std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+            // An aborted chunk has not completed all layers. Do not report the entire requested prompt as read.
+            const int64_t fresh = cancelled && produced_n == 0 ? std::max<int64_t>(0, pp_done - resume) : n - resume;
+            std::fprintf(stderr, "strata serve: prompt %lld tokens: %lld reused, %lld read in %.0f ms (%.1f tok/s), "
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
                          (long long) n, (long long) resume, (long long) fresh, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,

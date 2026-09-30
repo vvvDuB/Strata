@@ -853,6 +853,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         };
         if (stream_all) issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (should_stop && should_stop()) {
+                // A 4096-token chunk can take tens of seconds with mmap experts. Stop between layers,
+                // not just chunks. Drain already queued work before the caller refills our lent buffers;
+                // the incomplete chunk must not publish a checkpoint or advance on_chunk.
+                if (stream_all) m.stager->finish();
+                cudaStreamSynchronize(m.copy);
+                cudaStreamSynchronize(m.cs);
+                std::fprintf(stderr, "strata prefill: cancelled at position %lld, layer %lld (chunk %lld tokens incomplete)\n",
+                             (long long) p0, (long long) l, (long long) T);
+                err = "cancelled";
+                return false;
+            }
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)

@@ -1,0 +1,19 @@
+cmake_minimum_required(VERSION 3.20)
+# Also runnable alone: this checkout lacks several unrelated upstream test sources.
+# When included from the parent, these targets are already registered there.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(strata_cache_tests LANGUAGES CXX)
+  set(CMAKE_CXX_STANDARD 17)
+  enable_testing()
+  set(ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+  add_executable(conversation_store_test conversation_store_test.cpp
+    "${ROOT}/src/program/conversation_store.cpp" "${ROOT}/src/program/prefix_file.cpp")
+  add_executable(prefix_file_test prefix_file_test.cpp "${ROOT}/src/program/prefix_file.cpp")
+  add_executable(conv_cache_test "${ROOT}/src/program/conv_cache_test.cpp")
+  add_executable(conv_cache_policy_test conv_cache_policy_test.cpp)
+  add_executable(request_stop_test request_stop_test.cpp)
+  foreach(target conversation_store_test prefix_file_test conv_cache_test conv_cache_policy_test request_stop_test)
+    target_include_directories(${target} PRIVATE "${ROOT}/include")
+    add_test(NAME ${target} COMMAND ${target} "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  endforeach()
+endif()

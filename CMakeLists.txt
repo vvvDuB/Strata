@@ -216,6 +216,10 @@ if(STRATA_ENABLE_CUDA)
     src/kernels/cuda/native_qsa_score.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
+  # Standalone GPU regression; needs neither model weights nor the unpublished oracle suite.
+  add_executable(native_ple_batch_test EXCLUDE_FROM_ALL tests/native_ple_batch_test.cpp)
+  target_link_libraries(native_ple_batch_test PRIVATE strata_kernels CUDA::cudart)
+
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
   set(STRATA_ORACLE_BUILD_DIR "" CACHE PATH "Matching existing shared llama.cpp build")
   if(STRATA_ORACLE_SOURCE_DIR AND STRATA_ORACLE_BUILD_DIR)
@@ -249,6 +253,8 @@ if(STRATA_ENABLE_CUDA)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+  add_executable(file_expert_source_test EXCLUDE_FROM_ALL tests/file_expert_source_test.cpp)
+  target_link_libraries(file_expert_source_test PRIVATE strata_engine)
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
@@ -258,7 +264,7 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
 
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/prefix_file.cpp src/program/prefix_state.cpp src/program/conversation_store.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
 
@@ -459,6 +465,18 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  add_executable(conv_cache_policy_test tests/conv_cache_policy_test.cpp)
+  target_include_directories(conv_cache_policy_test PRIVATE include)
+  add_test(NAME conv_cache_policy_test COMMAND conv_cache_policy_test)
+  add_executable(request_stop_test tests/request_stop_test.cpp)
+  target_include_directories(request_stop_test PRIVATE include)
+  add_test(NAME request_stop_test COMMAND request_stop_test)
+  add_executable(prefix_file_test tests/prefix_file_test.cpp src/program/prefix_file.cpp)
+  target_include_directories(prefix_file_test PRIVATE include)
+  add_test(NAME prefix_file_test COMMAND prefix_file_test ${CMAKE_CURRENT_BINARY_DIR}/prefix-file-tests)
+  add_executable(conversation_store_test tests/conversation_store_test.cpp src/program/conversation_store.cpp src/program/prefix_file.cpp)
+  target_include_directories(conversation_store_test PRIVATE include)
+  add_test(NAME conversation_store_test COMMAND conversation_store_test ${CMAKE_CURRENT_BINARY_DIR}/conversation-store-tests)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

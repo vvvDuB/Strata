@@ -245,7 +245,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k);
 /// The pool half of the same decision; see `ExpertDispatch::is_hit`.
 
-/// **PHASE 2'S ONLY SOURCE: `experts.bin`, memory-mapped, no cache.**
+/// File-backed `experts.bin`, memory-mapped, no application-level cache.
+/// Native packs use snapshotted per-layer sizes; the following historical numbers describe canonical packs.
 ///
 /// `experts.bin` is 33,973,862,400 B and `BLOB` is 1,382,400, so it holds exactly `48 x 512 = 24,576` blobs and
 /// the index is `layer * 512 + expert` with NO padding.  A mapping is therefore the whole implementation: the
@@ -266,7 +267,8 @@ public:
     FileExpertSource(const FileExpertSource&) = delete;
     FileExpertSource& operator=(const FileExpertSource&) = delete;
 
-    /// Maps `<pack_dir>/experts.bin` and checks its size against `n_layers * n_expert * BLOB`.
+    /// Maps `<pack_dir>/experts.bin`: canonical BLOBs or native per-layer ExpertLayout sizes.
+    /// Load the native layout before open(); offsets and mapping length are then snapshotted.
     ///
     /// The size check is not a formality: a short file would fault at the END of a long sequence, and an
     /// over-long one means the pack is not the one the geometry came from.  Refuses with the two numbers.
@@ -284,6 +286,8 @@ public:
 
 private:
     const uint8_t* base_ = nullptr;
+    uint64_t mapped_bytes_ = 0;
+    std::vector<uint64_t> offsets_, blob_bytes_;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;
