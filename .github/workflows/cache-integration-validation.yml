@@ -24,7 +24,7 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake ninja-build g++ libssl-dev python3-venv
           python3 -m venv /opt/cache-test-env
-          /opt/cache-test-env/bin/pip install jinja2 regex
+          /opt/cache-test-env/bin/pip install jinja2 regex numpy
           echo '/opt/cache-test-env/bin' >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
         with:
