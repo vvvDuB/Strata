@@ -43,7 +43,7 @@ jobs:
           git switch -c integration/conversation-cache-unified f330adfa16cf54ff9824d47b25b08fb0440cecf8
           git merge --no-commit --no-ff source-pr190 || test -f .git/MERGE_HEAD
           python "$RUNNER_TEMP/cache-recipe/apply.py" "$RUNNER_TEMP/cache-recipe" 2>&1 | tee "$RUNNER_TEMP/cache-logs/reconstruct.log"
-          test "$(git write-tree)" = bb00a92650e41a51f5093413abb9ba5a578b6784
+          test "$(git write-tree)" = a2cc50536916acadb4a6427b4cc8b7d25c812497
       - name: Host cache and serving regressions
         run: |
           set -euo pipefail
@@ -80,6 +80,7 @@ jobs:
           CUDA_VISIBLE_DEVICES=-1 ctest --test-dir "$RUNNER_TEMP/build-cache-cuda" \
             -R '^(conversation_validation_test|conversation_transfer_test)$' --output-on-failure \
             2>&1 | tee "$RUNNER_TEMP/cache-logs/transfer-ctest.log"
+          "$RUNNER_TEMP/build-cache-cuda/strata" --help > "$RUNNER_TEMP/cache-logs/engine-help.log" 2>&1
           cmake -S . -B "$RUNNER_TEMP/build-cache-cuda" -DSTRATA_ENABLE_CONVERSATION_DISK=OFF
           cmake --build "$RUNNER_TEMP/build-cache-cuda" -j2 --target strata \
             2>&1 | tee "$RUNNER_TEMP/cache-logs/cuda-disk-off-build.log"
@@ -88,7 +89,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(git write-tree)" = bb00a92650e41a51f5093413abb9ba5a578b6784
+          test "$(git write-tree)" = a2cc50536916acadb4a6427b4cc8b7d25c812497
           git diff --exit-code
           test "$(git ls-remote origin refs/heads/main | cut -f1)" = f330adfa16cf54ff9824d47b25b08fb0440cecf8
           test -z "$(git ls-remote origin refs/heads/integration/conversation-cache-unified)"
