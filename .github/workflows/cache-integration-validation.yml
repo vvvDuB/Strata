@@ -3,43 +3,107 @@ name: Cache integration validation
 on:
   push:
     branches: [work/cache-integration-validation]
+    paths:
+      - '.github/workflows/cache-integration-validation.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  baseline:
+  integration:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Build prerequisites
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake ninja-build g++ libssl-dev python3-venv
+          python3 -m venv /opt/cache-test-env
+          /opt/cache-test-env/bin/pip install jinja2 regex
+          echo '/opt/cache-test-env/bin' >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Export pinned public source histories
-        shell: bash
+      - name: Reconstruct exact locally tested integration
         run: |
           set -euo pipefail
-          git branch source-fork f330adfa16cf54ff9824d47b25b08fb0440cecf8
-          git fetch --no-tags https://github.com/Niko1221/Strata.git \
-            refs/pull/189/head:refs/heads/source-pr189 \
-            refs/pull/190/head:refs/heads/source-pr190 \
-            refs/pull/203/head:refs/heads/source-pr203
-          test "$(git rev-parse source-pr189)" = f1b0c1647899259010879c99a035af999e78e0e2
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p "$RUNNER_TEMP/cache-recipe" "$RUNNER_TEMP/cache-logs"
+          cp .github/cache-integration/{apply.py,payload.1,payload.2} "$RUNNER_TEMP/cache-recipe/"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/Niko1221/Strata.git refs/pull/190/head:refs/heads/source-pr190
           test "$(git rev-parse source-pr190)" = 18c475e4b6dfea517a47f34ed95c427ed12a7901
-          test "$(git rev-parse source-pr203)" = 3b6100c101fbcee6612144854991a51eb1eb481b
-          git bundle create "$RUNNER_TEMP/cache-integration-sources.bundle" \
-            source-fork source-pr189 source-pr190 source-pr203
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cache-integration-sources
-          path: ${{ runner.temp }}/cache-integration-sources.bundle
-          retention-days: 7
-          if-no-files-found: error
-      - name: Baseline standalone cache tests
-        shell: bash
+          git switch -c integration/conversation-cache-unified f330adfa16cf54ff9824d47b25b08fb0440cecf8
+          git merge --no-commit --no-ff source-pr190 || test -f .git/MERGE_HEAD
+          python "$RUNNER_TEMP/cache-recipe/apply.py" "$RUNNER_TEMP/cache-recipe" 2>&1 | tee "$RUNNER_TEMP/cache-logs/reconstruct.log"
+          test "$(git write-tree)" = bb00a92650e41a51f5093413abb9ba5a578b6784
+      - name: Host cache and serving regressions
         run: |
           set -euo pipefail
-          cmake -S tests -B build-cache-baseline
-          cmake --build build-cache-baseline -j2
-          ctest --test-dir build-cache-baseline --output-on-failure
+          cmake -S . -B "$RUNNER_TEMP/build-cache-host" -G Ninja \
+            -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_NATIVE_EXPERTS=OFF \
+            -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_ENABLE_CONVERSATION_DISK=ON
+          cmake --build "$RUNNER_TEMP/build-cache-host" -j2 --target \
+            conversation_cache_test conversation_memory_test conversation_file_test shared_conversation_store_test \
+            conversation_io_cancel_test checkpoint_records_test checkpoint_staging_test conv_cache_test \
+            conv_cache_policy_test request_stop_test prefix_file_test conversation_store_test
+          ctest --test-dir "$RUNNER_TEMP/build-cache-host" --output-on-failure 2>&1 | tee "$RUNNER_TEMP/cache-logs/host-ctest.log"
+          python -m unittest discover -s serve -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/cache-logs/server.log"
+          python -m unittest discover -s tests -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/cache-logs/python-tests.log"
+          python -m unittest discover -s tools -p 'test_conversation_cache_*.py' 2>&1 | tee "$RUNNER_TEMP/cache-logs/replay.log"
+          python -O -m unittest discover -s tools -p 'test_conversation_cache_*.py' 2>&1 | tee "$RUNNER_TEMP/cache-logs/replay-optimized.log"
+          python -m unittest discover -s tools -p 'test_cache_fork_integration.py' 2>&1 | tee "$RUNNER_TEMP/cache-logs/fork-contracts.log"
+      - name: CUDA 12.8 SM120 native engine build and host transfer checks
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/llama"
+          git -C "$RUNNER_TEMP/llama" fetch --depth=1 https://github.com/ggml-org/llama.cpp.git 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          git -C "$RUNNER_TEMP/llama" checkout --detach FETCH_HEAD
+          cmake -S . -B "$RUNNER_TEMP/build-cache-cuda" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_PORTABLE=ON -DSTRATA_NATIVE_EXPERTS=ON \
+            -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=ON \
+            -DSTRATA_ENABLE_CONVERSATION_DISK=ON -DSTRATA_GGML_DIR="$RUNNER_TEMP/llama" \
+            2>&1 | tee "$RUNNER_TEMP/cache-logs/cuda-configure.log"
+          cmake --build "$RUNNER_TEMP/build-cache-cuda" -j2 --target strata conversation_validation_test conversation_transfer_test \
+            2>&1 | tee "$RUNNER_TEMP/cache-logs/cuda-build.log"
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -s /usr/local/cuda/lib64/stubs/libcuda.so "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          CUDA_VISIBLE_DEVICES=-1 ctest --test-dir "$RUNNER_TEMP/build-cache-cuda" \
+            -R '^(conversation_validation_test|conversation_transfer_test)$' --output-on-failure \
+            2>&1 | tee "$RUNNER_TEMP/cache-logs/transfer-ctest.log"
+          cmake -S . -B "$RUNNER_TEMP/build-cache-cuda" -DSTRATA_ENABLE_CONVERSATION_DISK=OFF
+          cmake --build "$RUNNER_TEMP/build-cache-cuda" -j2 --target strata \
+            2>&1 | tee "$RUNNER_TEMP/cache-logs/cuda-disk-off-build.log"
+      - name: Publish isolated branch, never main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git write-tree)" = bb00a92650e41a51f5093413abb9ba5a578b6784
+          git diff --exit-code
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = f330adfa16cf54ff9824d47b25b08fb0440cecf8
+          test -z "$(git ls-remote origin refs/heads/integration/conversation-cache-unified)"
+          # Publish the CI workflow separately through the authenticated connector.
+          # It was part of the verified tree, but Actions tokens cannot edit workflows.
+          git rm --cached .github/workflows/cache-regression.yml
+          git commit -m 'feat(cache): integrate RAM/NVMe snapshots with fork-compatible checkpointing' \
+            -m 'Merge upstream #189/#190 once, retaining contributor history. Preserve balanced/exact-boundary policies, legacy CLI storage semantics, cancellation and CPU customizations. Adapt #203 pinned staging as an opt-in path, with full-state capture and checked teardown. No GPU runtime or inference speed claim.'
+          git -c credential.helper='!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
+            push origin HEAD:refs/heads/integration/conversation-cache-unified
+          git show -s --format=fuller HEAD | tee "$RUNNER_TEMP/cache-logs/published-commit.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cache-integration-validation-logs
+          path: ${{ runner.temp }}/cache-logs
+          retention-days: 14
+          if-no-files-found: warn
