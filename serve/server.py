@@ -50,6 +50,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.winjob import contain  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -213,10 +214,12 @@ class StrataEngine:
                              daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        contain(self.proc)                               # ends with the server, however it ends (Windows)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
@@ -362,6 +365,7 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
+        self.prefill_tok_s_mean = None
         self.last = {}  # an ERR/dead pipe must not reuse the previous request's cache counters
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
@@ -397,6 +401,7 @@ class StrataEngine:
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -448,6 +453,7 @@ class Vision:
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
+        contain(self.proc)
         line = self.proc.stdout.readline()
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
@@ -536,12 +542,22 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
-def engine_args(cfg: dict) -> list[str]:
+def engine_args(cfg: dict, *, tokenizer: Path | None = None, template: Path | None = None) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    if "--conversation-cache-disk" in args:
+        # The frontend owns tokenization. Bind its actual files, including the
+        # fallback template, instead of assuming they live below --pack.
+        for flag, path in (("--conversation-cache-tokenizer", tokenizer), ("--conversation-cache-template", template)):
+            if path is None:
+                continue
+            while flag in args:
+                index = args.index(flag)
+                del args[index:index + 2]
+            args += [flag, str(path.resolve())]
     return args
 
 
@@ -675,7 +691,8 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean()},
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None))
 
@@ -701,6 +718,12 @@ class Service:
             return 0.0
         return s["generated"] / max(1e-6, time.time() - s["first_token"])
 
+    def _prefill_tok_s_mean(self):
+        """Engine-reported mean over newly read tokens, excluding the cached prefix."""
+        with self.status_lock:
+            reading = self.status.get("busy") and self.status.get("first_token") is None
+        return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -723,6 +746,7 @@ class Service:
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
+                "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
@@ -1799,6 +1823,8 @@ def main(argv=None) -> int:
                  f"Close it, or start this one with a different --port")
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
+    tpl = tpath / "chat_template.jinja"
+    template_path = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
@@ -1825,14 +1851,14 @@ def main(argv=None) -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        engine = StrataEngine(cfg["exe"], engine_args(cfg, tokenizer=tpath, template=template_path),
+                              cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    svc = Service(engine, tok, ChatTemplate(template_path),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)

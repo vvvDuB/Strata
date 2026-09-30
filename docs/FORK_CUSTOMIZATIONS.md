@@ -119,3 +119,12 @@ throughput comparison against the old engine and not a Pi/Claude capture test.
 Counts-only evidence is in
 `bench/results/2026-09-30-fork-integration/summary.json`; raw HTTP/log evidence
 remains private outside the repository.
+
+## Shared-cache integration follow-up
+
+See [CACHE_INTEGRATION.md](CACHE_INTEGRATION.md) for the compatible #189/#190
+integration and opt-in #203 staging adaptation. The existing disk CLI retains
+its meaning; RAM parking uses `--conversation-ram-cache-*`. Checkpoint payload
+identity is now v2 (five buffers, including indexer accumulator and position),
+so use a fresh cache namespace for validation. Earlier live-model results above
+belong to the previous build and are not validation of this integration.

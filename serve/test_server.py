@@ -350,6 +350,27 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class DiskCacheArguments(unittest.TestCase):
+    def test_frontend_files_override_stale_config_identity(self):
+        from serve.server import engine_args
+        original = ["--conversation-cache-disk", "disk-cache", "--conversation-cache-disk-mib", "1024",
+                    "--conversation-cache-tokenizer", "old-tokens", "--conversation-cache-template", "old-template"]
+        cfg = {"args": original[:], "gpu": [0, 1]}
+        tokenizer, template = Path("actual-tokens"), Path("actual-template")
+        result = engine_args(cfg, tokenizer=tokenizer, template=template)
+        self.assertEqual(result[result.index("--conversation-cache-tokenizer") + 1], str(tokenizer.resolve()))
+        self.assertEqual(result[result.index("--conversation-cache-template") + 1], str(template.resolve()))
+        self.assertEqual(result.count("--conversation-cache-tokenizer"), 1)
+        self.assertEqual(result.count("--conversation-cache-template"), 1)
+        self.assertIn("--layer-split", result)
+        self.assertEqual(cfg["args"], original)
+
+    def test_no_disk_flag_keeps_existing_engine_arguments(self):
+        from serve.server import engine_args
+        cfg = {"args": ["--pack", "pack", "--conversation-ram-cache-mib", "1024"]}
+        self.assertEqual(engine_args(cfg, tokenizer=Path("tokens"), template=Path("template")), cfg["args"])
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
@@ -479,6 +500,41 @@ class LiveRate(unittest.TestCase):
     def metrics(self):
         with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
             return json.loads(r.read())
+
+    def test_prefill_rate_excludes_cached_tokens(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO())
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        engine.prefill_tok_s_mean = 9999.0
+        engine.lines.put("PP 10000 12000 2000 1000.0")  # 8000 cached, 2000 newly read in two seconds
+        engine.lines.put("DONE 1 12000 4000 10 stop 0 0 8000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.assertEqual(engine.progress, (10000, 12000))
+        self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
+        self.svc.engine = engine
+        self.svc.status.update(busy=True, first_token=None)
+        self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
+        self.assertNotIn("prefill_tok_s", self.metrics()["live"])
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
+        self.svc.status.update(first_token=time.time(), generated=1)
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
+        self.assertEqual(list(gen), [])
+        timings = request_timings(12000, 1, engine.last)
+        self.assertEqual(timings["prompt_per_second"], 1000.0)
+        engine.lines.put("PP 8000 12000")
+        engine.lines.put("DONE 0 12000 0 0 stop 0 0 12000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        next(gen)
+        self.assertIsNone(engine.prefill_tok_s_mean)
+        list(gen)
+        self.svc.status["busy"] = False
+        self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
