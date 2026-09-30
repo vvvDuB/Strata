@@ -2,11 +2,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <functional>
 struct C { std::vector<uint8_t> gdn, ple, tails, dead, block_pos; };
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "failed line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 int main() {
     using namespace strata::program::checkpoint_records;
     C a{{1,2}, {}, {3,4,5}, {6,7}, {8,9,10,11}};
+    std::vector<std::reference_wrapper<const std::vector<uint8_t>>> loans;
+    borrow(loans,a);
+    CHECK(loans.size()==count);
+    CHECK(&loans[0].get()==&a.gdn && &loans[1].get()==&a.ple && &loans[2].get()==&a.tails &&
+          &loans[3].get()==&a.dead && &loans[4].get()==&a.block_pos);
     Blobs b; append(b,a); append(b,a);
     CHECK(valid(b,2,{2,0,3,2,4}));
     CHECK(!valid(b,std::numeric_limits<size_t>::max(),{2,0,3,2,4}));

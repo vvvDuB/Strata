@@ -5,6 +5,9 @@
 #include <functional>
 namespace strata::program {
 using PrefixBlob = std::vector<uint8_t>;
+// Synchronous, read-only loans: each source must remain immutable and alive
+// until prefix_write/ConversationStore::put returns. Never retained by the store.
+using BorrowedPrefixBlobs = std::vector<std::reference_wrapper<const PrefixBlob>>;
 struct PrefixFile {
     std::string identity;
     std::vector<int32_t> tokens;
@@ -15,7 +18,8 @@ inline constexpr uint64_t kPrefixMaxBytes = 2ull << 30;
 bool prefix_is_system(const std::vector<int64_t>& tokens);
 uint64_t prefix_hash(const void* p, size_t n);
 bool prefix_write(const std::string& path, const PrefixFile& file, std::string& error,
-                  uint64_t max_bytes = kPrefixMaxBytes, const std::function<bool()>& cancelled = {});
+                  uint64_t max_bytes = kPrefixMaxBytes, const std::function<bool()>& cancelled = {},
+                  const BorrowedPrefixBlobs& borrowed = {});
 bool prefix_read(const std::string& path, PrefixFile& file, bool metadata_only, std::string& error,
                  uint64_t max_bytes = kPrefixMaxBytes, const std::function<bool()>& cancelled = {});
 int64_t prefix_match(const PrefixFile& file, const std::vector<int64_t>& tokens);

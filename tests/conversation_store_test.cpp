@@ -41,6 +41,8 @@ int main(int argc, char** argv) {
         check(!store.open(dir,"test-model",2,1600,error) && store.size()==2,"reopen rejected without dropping lock or index");
         auto ha=store.find(tokens(a)), hb=store.find(tokens(b));
         check(ha.position==5 && hb.position==5 && ha.path!=hb.path,"A/B/A exact branch lookup");
+        check(store.find(tokens(a),0,{ha.path}).position==2,"rejected candidate is excluded even if its file cannot be removed");
+        check(store.find(tokens(a),0,{ha.path,hb.path}).position==0,"excluding every rejected candidate terminates at a miss");
         check(store.find({10,20,90,40,50,99}).position==2,"sibling only reuses common checkpoint");
         check(store.find({11,20,30,40,50,99}).position==0,"changed early token is a miss");
         check(store.find(tokens(a),5).position==0,"RAM wins on equal match");

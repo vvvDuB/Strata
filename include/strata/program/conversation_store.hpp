@@ -14,13 +14,14 @@ public:
     ConversationStore& operator=(const ConversationStore&) = delete;
     bool open(const std::string& dir, const std::string& identity, size_t slots,
               uint64_t budget, std::string& error);
-    ConversationHit find(const std::vector<int64_t>& tokens, int64_t better_than = 0) const;
+    ConversationHit find(const std::vector<int64_t>& tokens, int64_t better_than = 0,
+                         const std::vector<std::string>& excluded = {}) const;
     // Metadata-only deduplication before GPU capture and multi-GiB staging.
     bool contains(const std::vector<int32_t>& tokens) const;
     bool load(const ConversationHit&, PrefixFile&, std::string& error,
               const std::function<bool()>& cancelled = {});
     bool put(const PrefixFile&, const std::string& protected_path, std::string& error,
-             const std::function<bool()>& cancelled = {});
+             const std::function<bool()>& cancelled = {}, const BorrowedPrefixBlobs& borrowed = {});
     void discard(const std::string& path);
     size_t size() const { return entries_.size(); }
     uint64_t bytes() const;

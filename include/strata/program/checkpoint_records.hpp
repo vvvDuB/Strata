@@ -20,6 +20,12 @@ void append(Blobs& blobs, const Checkpoint& c) {
     blobs.push_back(c.dead); blobs.push_back(c.block_pos);
 }
 
+template<class Loans, class Checkpoint>
+void borrow(Loans& loans, const Checkpoint& c) {
+    loans.emplace_back(c.gdn); loans.emplace_back(c.ple); loans.emplace_back(c.tails);
+    loans.emplace_back(c.dead); loans.emplace_back(c.block_pos);
+}
+
 inline bool valid(const Blobs& blobs, size_t records, const std::array<size_t, count>& sizes) {
     if (records > blobs.size() / count) return false;
     for (size_t i = 0; i < records; ++i)

@@ -51,6 +51,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
+from serve.cache_timings import parse_phase_timings  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -305,6 +306,9 @@ class StrataEngine:
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # cache coverage diagnostics (optional)
             self.last.update(common_prefix_tokens=int(f[11]), replay_gap_tokens=int(f[12]), cache_source=f[13])
+        phases = parse_phase_timings(f[14:])
+        if phases:
+            self.last["cache_timings"] = phases
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1030,7 +1034,8 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            **({"cache_timings": dict(last["cache_timings"])} if last.get("cache_timings") else {})}
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):

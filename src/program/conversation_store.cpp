@@ -18,8 +18,11 @@ bool owned_name(const std::string& name) {
     return name.size()==27 && name.substr(0,7)=="branch-" && name.substr(23)==".bin" &&
         name.find_first_not_of("0123456789abcdef",7)>=23;
 }
-uint64_t wire_bytes(const PrefixFile& f) {
+uint64_t wire_bytes(const PrefixFile& f,const BorrowedPrefixBlobs& borrowed) {
+    if (f.blobs.size()>256 || borrowed.size()>256-f.blobs.size())
+        throw std::runtime_error("too many state records");
     uint64_t n=8+16+f.identity.size()+16+f.tokens.size()*4+16+f.positions.size()*8+8+8;
+    for (const auto& b:borrowed) n+=16+b.get().size();
     for (const auto& b:f.blobs) n+=16+b.size();
     return n;
 }
@@ -85,9 +88,11 @@ bool ConversationStore::open(const std::string& dir,const std::string& identity,
     }
 #endif
 }
-ConversationHit ConversationStore::find(const std::vector<int64_t>& tokens,int64_t better_than) const {
+ConversationHit ConversationStore::find(const std::vector<int64_t>& tokens,int64_t better_than,
+                                        const std::vector<std::string>& excluded) const {
     ConversationHit hit;
     for (const auto& e:entries_) {
+        if (std::find(excluded.begin(),excluded.end(),e.path)!=excluded.end()) continue;
         const auto pos=prefix_match(e.meta,tokens);
         if (pos>better_than) {hit={e.path,pos};better_than=pos;}
     }
@@ -123,12 +128,12 @@ bool ConversationStore::load(const ConversationHit& hit,PrefixFile& f,std::strin
     return true;
 }
 bool ConversationStore::put(const PrefixFile& f,const std::string& protected_path,std::string& error,
-                            const std::function<bool()>& cancelled) {
+                            const std::function<bool()>& cancelled,const BorrowedPrefixBlobs& borrowed) {
     try {
         if (lock_<0 || f.identity!=identity_ || f.tokens.empty() || f.positions.empty() ||
             f.positions.back()!=f.tokens.size()) throw std::runtime_error("invalid branch metadata");
         if (cancelled && cancelled()) throw std::runtime_error("cancelled");
-        const auto need=wire_bytes(f);
+        const auto need=wire_bytes(f,borrowed);
         if (need>budget_ || need>kConversationMaxBytes) throw std::runtime_error("branch exceeds cache byte budget");
         if (contains(f.tokens)) return true;
         // The index can outlive a file removed/truncated outside the engine. Do not
@@ -156,7 +161,7 @@ bool ConversationStore::put(const PrefixFile& f,const std::string& protected_pat
         }
         std::ostringstream name;name<<dir_<<"/branch-"<<std::hex<<std::setfill('0')<<std::setw(16)
             <<(prefix_hash(f.tokens.data(),f.tokens.size()*4)^prefix_hash(identity_.data(),identity_.size()))<<".bin";
-        if (!prefix_write(name.str(),f,error,kConversationMaxBytes,cancelled)) return false;
+        if (!prefix_write(name.str(),f,error,kConversationMaxBytes,cancelled,borrowed)) return false;
         std::vector<std::string> superseded;
         for (const auto& e:entries_) if (e.path!=protected_path && extends(e.meta,f)) superseded.push_back(e.path);
         for (const auto& path:superseded) discard(path);

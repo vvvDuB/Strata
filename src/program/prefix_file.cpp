@@ -1,4 +1,5 @@
 #include "strata/program/prefix_file.hpp"
+#include "strata/program/prefix_hash_batch.hpp"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -41,14 +42,16 @@ template<class T> std::vector<T> values(const PrefixBlob& b) {
 }
 }
 bool prefix_write(const std::string& path,const PrefixFile& file,std::string& error,
-                  uint64_t max_bytes,const std::function<bool()>& cancelled) {
+                  uint64_t max_bytes,const std::function<bool()>& cancelled,
+                  const BorrowedPrefixBlobs& borrowed) {
 #if defined(_WIN32)
     error="persistent prefix v1 currently requires Linux";return false;
 #else
     std::string temp;FILE* out=nullptr;
     try {
         validate_meta(file);
-        if(file.blobs.size()>256)throw std::runtime_error("too many state records");
+        if(file.blobs.size()>256 || borrowed.size()>256-file.blobs.size())
+            throw std::runtime_error("too many state records");
         if(std::filesystem::exists(path))throw std::runtime_error("cache already exists");
         auto parent=std::filesystem::path(path).parent_path();
         if(!parent.empty() && !std::filesystem::exists(parent)) {
@@ -71,8 +74,28 @@ bool prefix_write(const std::string& path,const PrefixFile& file,std::string& er
         };
         put(magic,8);record(file.identity.data(),file.identity.size());
         record(file.tokens.data(),file.tokens.size()*4);record(file.positions.data(),file.positions.size()*8);
-        uint64_t count=file.blobs.size();put(&count,8);
-        for(const auto& b:file.blobs)record(b.data(),b.size());
+        uint64_t count=borrowed.size()+file.blobs.size();put(&count,8);
+        // Checkpoint loans precede captured KV, exactly like the owned v2 codec.
+        // Validate bounds before hashing. Loans remain immutable until all joined
+        // checksum workers and the synchronous writer have finished.
+        std::vector<PrefixHashJob> jobs;
+        uint64_t required=total;
+        auto job=[&](const PrefixBlob& b){
+            if(b.size()>max_record)throw std::runtime_error("state record too large");
+            if(required>max_bytes || 16>max_bytes-required || b.size()>max_bytes-required-16)
+                throw std::runtime_error("cache write failed or exceeds byte limit");
+            required+=16+b.size();jobs.push_back({b.data(),b.size()});
+        };
+        for(const auto& b:borrowed)job(b.get());
+        for(const auto& b:file.blobs)job(b);
+        if(required>max_bytes || 8>max_bytes-required)
+            throw std::runtime_error("cache write failed or exceeds byte limit");
+        std::vector<uint64_t> hashes;
+        std::string hash_error;
+        if(!prefix_hash_batch(jobs,hashes,hash_error,cancelled))throw std::runtime_error(hash_error);
+        for(size_t i=0;i<jobs.size();++i){
+            uint64_t len=jobs[i].size;put(&len,8);put(&hashes[i],8);put(jobs[i].data,jobs[i].size);
+        }
         put(footer,8);
         if(fflush(out) || fsync(fileno(out)))throw std::runtime_error("cache sync failed");
         fclose(out);out=nullptr;
@@ -100,11 +123,12 @@ bool prefix_read(const std::string& path,PrefixFile& file,bool metadata_only,std
             if(n>remaining || (n && !in.read(static_cast<char*>(p),(std::streamsize)n)))throw std::runtime_error("truncated cache");
             remaining-=n;
         };
-        auto record=[&](uint64_t limit){
+        auto record=[&](uint64_t limit,uint64_t* deferred_hash=nullptr){
             uint64_t len,hash;get(&len,8);get(&hash,8);
             if(len>limit || len>remaining)throw std::runtime_error("invalid record length");
             PrefixBlob b((size_t)len);get(b.data(),b.size());
-            if(prefix_hash(b.data(),b.size())!=hash)throw std::runtime_error("cache checksum mismatch");
+            if(deferred_hash)*deferred_hash=hash;
+            else if(prefix_hash(b.data(),b.size())!=hash)throw std::runtime_error("cache checksum mismatch");
             return b;
         };
         char m[8];get(m,8);if(std::memcmp(m,magic,8))throw std::runtime_error("unsupported cache format");
@@ -113,8 +137,18 @@ bool prefix_read(const std::string& path,PrefixFile& file,bool metadata_only,std
         f.tokens=values<int32_t>(record(262144*4));f.positions=values<uint64_t>(record(64*8));validate_meta(f);
         if(!metadata_only) {
             uint64_t n;get(&n,8);if(n>256)throw std::runtime_error("too many state records");
-            for(uint64_t i=0;i<n;++i)f.blobs.push_back(record(max_record));
+            std::vector<uint64_t> expected((size_t)n);
+            f.blobs.reserve((size_t)n);
+            for(uint64_t i=0;i<n;++i)f.blobs.push_back(record(max_record,&expected[i]));
             get(m,8);if(std::memcmp(m,footer,8) || remaining)throw std::runtime_error("invalid cache footer");
+            std::vector<PrefixHashJob> jobs;
+            for(const auto& b:f.blobs)jobs.push_back({b.data(),b.size()});
+            std::vector<uint64_t> hashes;
+            std::string hash_error;
+            // No state is published/restored until every bounded record passes
+            // its original scalar FNV checksum. Metadata-only lookup stays cheap.
+            if(!prefix_hash_batch(jobs,hashes,hash_error,cancelled))throw std::runtime_error(hash_error);
+            if(hashes!=expected)throw std::runtime_error("cache checksum mismatch");
         }
         file=std::move(f);return true;
     } catch(const std::exception& e){error=e.what();return false;}
