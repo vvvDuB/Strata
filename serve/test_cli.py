@@ -41,6 +41,13 @@ class ServerCLI(unittest.TestCase):
         self.assertEqual(cfg["log"], "/logs/engine.log")
         self.assertEqual(cfg["args"][-4:], ["--host", "native-host", "--log", "native-log"])
 
+    def test_direct_layer_split_keeps_the_gpu_list(self):
+        argv = self.direct()
+        argv[argv.index("--gpu") + 1] = "0,2"
+        _, _, cfg = self.parse(argv)
+        self.assertEqual(cfg["gpu"], "0,2")
+        self.assertEqual(server.gpu_list(cfg), [0, 2])
+
     def test_repeated_library_directories_preserve_order(self):
         argv = self.direct()
         argv[argv.index("--"):argv.index("--")] = ["--lib-dir", "/another lib"]

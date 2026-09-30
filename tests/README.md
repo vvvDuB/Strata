@@ -31,15 +31,15 @@ this test. Ordinary unittest discovery skips the live tests unless opted in.
 
 ## Native mmap experts
 
-`file_expert_source_test` uses small synthetic files with real native blob
+`local_file_expert_source_test` uses small synthetic files with real native blob
 formats, no GPU work and no model weights. It checks canonical compatibility,
 variable per-layer sizes/offsets, expert-index bounds, strict file-size checks,
 reopening, isolation from a subsequently loaded global layout, and full unmap
 (on Linux, including the last page).
 
 ```sh
-cmake --build build --target file_expert_source_test -j4
-build/file_expert_source_test /tmp/strata-mmap-test-new
+cmake --build build --target local_file_expert_source_test -j4
+build/local_file_expert_source_test /tmp/strata-mmap-test-new
 ```
 
 The supplied fixture directory must not already exist; fixtures are retained

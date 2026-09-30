@@ -1,0 +1,169 @@
+{
+  "upstream": "bbaaabb4643bb7873d4cef9d48b5dcf96e6cbff4",
+  "custom_snapshot": "cca1368273f7798350cba3c1a4fc84fb0012363b",
+  "date": "2026-09-30",
+  "model": "Qwen3.8-Flash-Next-IQ3",
+  "hardware": "RTX 5070 12 GB / 32 GiB host RAM",
+  "context_allocated": 131072,
+  "largest_completed_input": 9338,
+  "python_serve": {
+    "run": 97,
+    "skipped": 3,
+    "failed": 0
+  },
+  "python_capture": {
+    "run": 1,
+    "failed": 0
+  },
+  "cpp_cache_suites": 5,
+  "cpp_cache_asan_ubsan": 5,
+  "mmap_suites": 2,
+  "ple_sanitizer_batches": [
+    1,
+    2,
+    8,
+    9,
+    10,
+    64,
+    65,
+    77,
+    256,
+    1024
+  ],
+  "ple_errors": 0,
+  "openai_cache": [
+    {
+      "prompt_tokens": 9315,
+      "cached_tokens": 0,
+      "read_tokens": 9315,
+      "cache_ratio": 0.0,
+      "ttft_seconds": 54.8974,
+      "total_seconds": 55.0724,
+      "finish": "stop",
+      "case": "initial"
+    },
+    {
+      "prompt_tokens": 9315,
+      "cached_tokens": 9308,
+      "read_tokens": 7,
+      "cache_ratio": 0.99925,
+      "ttft_seconds": 0.3054,
+      "total_seconds": 0.4004,
+      "finish": "stop",
+      "case": "exact_repeat"
+    },
+    {
+      "prompt_tokens": 9338,
+      "cached_tokens": 9319,
+      "read_tokens": 19,
+      "cache_ratio": 0.99797,
+      "ttft_seconds": 0.577,
+      "total_seconds": 0.705,
+      "finish": "stop",
+      "case": "append"
+    },
+    {
+      "prompt_tokens": 9338,
+      "cached_tokens": 21,
+      "read_tokens": 9317,
+      "cache_ratio": 0.00225,
+      "ttft_seconds": 50.4557,
+      "total_seconds": 50.6138,
+      "finish": "stop",
+      "case": "history_edit"
+    },
+    {
+      "prompt_tokens": 9338,
+      "cached_tokens": 3077,
+      "read_tokens": 6261,
+      "cache_ratio": 0.32951,
+      "ttft_seconds": 33.3461,
+      "total_seconds": 33.4788,
+      "finish": "stop",
+      "case": "same_boundary_edit"
+    },
+    {
+      "prompt_tokens": 9338,
+      "cached_tokens": 0,
+      "read_tokens": 9338,
+      "cache_ratio": 0.0,
+      "ttft_seconds": 49.2429,
+      "total_seconds": 49.3809,
+      "finish": "stop",
+      "case": "other_system"
+    },
+    {
+      "prompt_tokens": 9338,
+      "cached_tokens": 9331,
+      "read_tokens": 7,
+      "cache_ratio": 0.99925,
+      "ttft_seconds": 4.2941,
+      "total_seconds": 4.386,
+      "finish": "stop",
+      "case": "return_to_previous_branch"
+    }
+  ],
+  "anthropic": [
+    {
+      "answer": "QUARZO",
+      "seconds": 5.25,
+      "input_tokens": 421,
+      "output_tokens": 4,
+      "cache_read_input_tokens": 0
+    },
+    {
+      "answer": "AMBRA",
+      "seconds": 3.515,
+      "input_tokens": 394,
+      "output_tokens": 3,
+      "cache_read_input_tokens": 3
+    },
+    {
+      "answer": "QUARZO",
+      "seconds": 2.415,
+      "input_tokens": 33,
+      "output_tokens": 4,
+      "cache_read_input_tokens": 414
+    },
+    {
+      "answer": "AMBRA",
+      "seconds": 2.418,
+      "input_tokens": 32,
+      "output_tokens": 3,
+      "cache_read_input_tokens": 390
+    },
+    {
+      "answer": "7",
+      "seconds": 1.808,
+      "input_tokens": 29,
+      "output_tokens": 2,
+      "cache_read_input_tokens": 3
+    }
+  ],
+  "cancellation": {
+    "cancel_seen_seconds": 0.201,
+    "replacement_done_seconds": 2.009,
+    "replacement_answer": "7",
+    "native_cancel_observed": true
+  },
+  "limitations": [
+    "single-GPU CUDA validation only",
+    "no completed full-128k input",
+    "no full-model numerical/logit parity",
+    "isolated synthetic conversations, not actual Pi or Claude Code captures",
+    "no throughput A/B against old native binary"
+  ],
+  "profile": {
+    "kv": "resident int8",
+    "mmap_experts": true,
+    "prefill": 4096,
+    "checkpoint_interval": 4096,
+    "checkpoint_slots": 12,
+    "checkpoint_policy": "balanced",
+    "root_pinning": true,
+    "mtp_spec": 4,
+    "vram_reserve_mib": 768,
+    "conversation_disk_mib": 8192,
+    "conversation_disk_slots": 4
+  }
+}
