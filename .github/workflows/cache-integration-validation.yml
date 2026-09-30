@@ -1,0 +1,45 @@
+name: Cache integration validation
+
+on:
+  push:
+    branches: [work/cache-integration-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export pinned public source histories
+        shell: bash
+        run: |
+          set -euo pipefail
+          git branch source-fork f330adfa16cf54ff9824d47b25b08fb0440cecf8
+          git fetch --no-tags https://github.com/Niko1221/Strata.git \
+            refs/pull/189/head:refs/heads/source-pr189 \
+            refs/pull/190/head:refs/heads/source-pr190 \
+            refs/pull/203/head:refs/heads/source-pr203
+          test "$(git rev-parse source-pr189)" = f1b0c1647899259010879c99a035af999e78e0e2
+          test "$(git rev-parse source-pr190)" = 18c475e4b6dfea517a47f34ed95c427ed12a7901
+          test "$(git rev-parse source-pr203)" = 3b6100c101fbcee6612144854991a51eb1eb481b
+          git bundle create "$RUNNER_TEMP/cache-integration-sources.bundle" \
+            source-fork source-pr189 source-pr190 source-pr203
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-integration-sources
+          path: ${{ runner.temp }}/cache-integration-sources.bundle
+          retention-days: 7
+          if-no-files-found: error
+      - name: Baseline standalone cache tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tests -B build-cache-baseline
+          cmake --build build-cache-baseline -j2
+          ctest --test-dir build-cache-baseline --output-on-failure
