@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import base64
 import hashlib
 import hmac
@@ -29,6 +30,8 @@ import codecs
 import json
 import os
 import queue
+import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,6 +59,49 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+
+
+@contextlib.contextmanager
+def client_cancellation(connection):
+    """Notice a disconnected client even during silent prefill or while queued.
+
+    The request body is already read. Peek only: never consume pipelined bytes.
+    This event belongs to this request, not to whichever request owns the GPU.
+    """
+    cancel, finished = threading.Event(), threading.Event()
+
+    def watch():
+        while not finished.wait(0.1):
+            try:
+                readable, _, _ = select.select([connection], [], [], 0)
+                if readable and not connection.recv(1, socket.MSG_PEEK):
+                    cancel.set()
+                    return
+            except OSError:
+                cancel.set()
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        yield cancel
+    finally:
+        finished.set()
+        watcher.join()
+
+
+@contextlib.contextmanager
+def cancellable_lock(lock, cancel):
+    acquired = False
+    try:
+        while not cancel.is_set():
+            if lock.acquire(timeout=0.1):
+                acquired = True
+                break
+        yield acquired and not cancel.is_set()
+    finally:
+        if acquired:
+            lock.release()
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -254,6 +300,8 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 14:                                  # cache coverage diagnostics (optional)
+            self.last.update(common_prefix_tokens=int(f[11]), replay_gap_tokens=int(f[12]), cache_source=f[13])
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -314,6 +362,7 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
+        self.last = {}  # an ERR/dead pipe must not reuse the previous request's cache counters
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -323,14 +372,19 @@ class StrataEngine:
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
+        heartbeat = time.monotonic()
         try:
             while True:
+                if cancel.is_set():
+                    return
                 try:
-                    line = self.lines.get(timeout=10)
+                    line = self.lines.get(timeout=0.1)
                 except queue.Empty:
                     if cancel.is_set():
                         return
-                    yield None
+                    if time.monotonic() - heartbeat >= 10:
+                        heartbeat = time.monotonic()
+                        yield None
                     continue
                 if line is None:
                     done = True
@@ -812,18 +866,19 @@ class Service:
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        cached_tokens = 0
+        owns_status = False
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
         with self.status_lock:
             self.status["queued"] += 1
-        try:
-            with self.fifo:
+        with cancellable_lock(self.fifo, cancel) as acquired:
+            try:
                 with self.status_lock:
                     self.status["queued"] -= 1
+                if not acquired:
+                    return
                 if hasattr(self.engine, "alive") and not self.engine.alive():
                     # issue #27: it died in an earlier request - start it again instead of failing every request
                     code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
@@ -832,6 +887,7 @@ class Service:
                     self.engine.restart()
                     print("[strata] the engine is running again", flush=True)
                 with self.status_lock:
+                    owns_status = True
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                     self.last_request_at = time.time()
@@ -874,58 +930,63 @@ class Service:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
-        except GeneratorExit:                           # the client disconnected mid-stream
-            finish = "disconnect"
-            raise
-        finally:
-            if emb:
-                Path(emb).unlink(missing_ok=True)
-            with self.status_lock:
-                if self.status.get("busy"):
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
-                    started = self.status.get("started", time.time())
-                    loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
-                    hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
-                        "projection": (sampling or {}).get("experimental_speed_projection") is not False
-                        if loaded else None,
-                        "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
-                        "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
-                        "engine_generated": last.get("generated"),
-                        "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
-                        "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                        if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
-                    t = self.totals
-                    t["requests"] += 1
-                    t["prompt_tokens"] += len(ids)
-                    t["reused"] += last.get("reused") or 0
-                    t["output_tokens"] += n
-                    t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                    t["decode_ms"] += last.get("decode_ms") or 0.0
+                    # Capture this request's DONE before releasing the FIFO: another request may replace last.
                     fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                        timings = request_timings(len(ids), n, last)
-                        self.last_timings = dict(timings, at=int(time.time())) if timings else None
-                    self.last_request_at = time.time()
-                    now = time.time()
-                    el = now - self.status.get("started", now)
-                    ft = self.status.get("first_token")
-                    rate = n / max(1e-6, now - ft) if ft else 0.0
-                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                    print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                    if os.environ.get("STRATA_DEBUG") and raw_ids:
-                        print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
-                self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
-                self.status.pop("tool", None)
+                    last = dict(fresh or {}) if fresh is not before else {}
+                    cached_tokens = max(0, min(len(ids), int(last.get("reused") or 0)))
+            except GeneratorExit:                           # the client disconnected mid-stream
+                finish = "disconnect"
+                raise
+            finally:
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
+                with self.status_lock:
+                    if owns_status and self.status.get("busy"):
+                        fresh = getattr(self.engine, "last", None)
+                        last = dict(fresh or {}) if fresh is not before else {}
+                        started = self.status.get("started", time.time())
+                        loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
+                        hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                        self.history.append({
+                            "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                            if loaded else None,
+                            "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                            "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                            "engine_generated": last.get("generated"),
+                            "common_prefix_tokens": last.get("common_prefix_tokens"),
+                            "replay_gap_tokens": last.get("replay_gap_tokens"), "cache_source": last.get("cache_source"),
+                            "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                            "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                            if n and last.get("generated") and last.get("decode_ms") else None,
+                            "hit_rate": hit_rate})
+                        t = self.totals
+                        t["requests"] += 1
+                        t["prompt_tokens"] += len(ids)
+                        t["reused"] += last.get("reused") or 0
+                        t["output_tokens"] += n
+                        t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                        t["decode_ms"] += last.get("decode_ms") or 0.0
+                        if fresh is not None and fresh is not before:
+                            timings = request_timings(len(ids), n, last)
+                            self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                        self.last_request_at = time.time()
+                        now = time.time()
+                        el = now - self.status.get("started", now)
+                        ft = self.status.get("first_token")
+                        rate = n / max(1e-6, now - ft) if ft else 0.0
+                        hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                        print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                              f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                        if os.environ.get("STRATA_DEBUG") and raw_ids:
+                            print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                    if owns_status:
+                        self.status["busy"] = False
+                        self.status.pop("tail", None)
+                        self.status.pop("tool", None)
         for ev in parser.finish():
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings}
+        yield "done", {"finish": finish, "completion_tokens": n, "cached_tokens": cached_tokens,
+                       "reused": cached_tokens, "timings": timings}
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1097,8 +1158,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
-                             # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+                             "prompt_tokens_details": {"cached_tokens": x.get("cached_tokens", 0)}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             yield last
@@ -1364,12 +1424,15 @@ def make_handler(svc: Service):
                 return
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                if path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
-                else:
-                    self._json(404, {"error": {"message": "not found"}})
+                with client_cancellation(self.connection) as cancel:
+                    if path == "/v1/chat/completions":
+                        self._openai(req, cancel)
+                    elif path == "/v1/messages":
+                        self._anthropic(req, cancel)
+                    else:
+                        self._json(404, {"error": {"message": "not found"}})
+            except OSError:
+                pass  # disconnected clients cannot receive an error response
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -1433,7 +1496,7 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
-        def _openai(self, req):
+        def _openai(self, req, cancel):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
@@ -1448,7 +1511,6 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -1473,13 +1535,12 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
-        def _anthropic(self, req):
+        def _anthropic(self, req, cancel):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -1660,11 +1721,47 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def engine_config_from_args(ap, a) -> dict:
+    """Choose one settings source; native argv is never reparsed or loaded from disk."""
+    direct = any(value is not None for value in (a.exe, a.cwd, a.log, a.model_name)) or bool(a.lib_dir or a.engine_args)
+    if a.config:
+        if direct:
+            ap.error("--config cannot be combined with direct engine settings or arguments after --")
+        cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))  # Notepad adds a BOM
+        if a.engine == "strata" and not cfg:
+            ap.error("--engine strata needs a non-empty engine configuration")
+    elif direct:
+        if a.engine != "strata":
+            ap.error("direct engine settings require --engine strata")
+        if not a.exe or not a.tokenizer or not a.engine_args or a.engine_args[0] != "--" or len(a.engine_args) < 2:
+            ap.error("--engine strata needs --exe, --tokenizer and native arguments after -- (or legacy --config)")
+        cfg = {"exe": a.exe, "args": a.engine_args[1:], "tokenizer": a.tokenizer}
+        for key in ("cwd", "log", "model_name"):
+            if getattr(a, key) is not None:
+                cfg[key] = getattr(a, key)
+        if a.lib_dir:
+            cfg["lib_dirs"] = list(a.lib_dir)
+    else:
+        if a.engine == "strata":
+            ap.error("--engine strata needs direct settings or legacy --config")
+        cfg = {}
+    if a.gpu is not None:
+        cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    return cfg
+
+
+def parse_server_options(argv=None):
+    """Parse wrapper settings before --, passing subsequent engine tokens unchanged."""
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
-                                     "written by setup.py")
+                                     "written by setup.py (legacy alternative to direct CLI settings)")
+    ap.add_argument("--exe", help="native Strata executable; pass its arguments after --")
+    ap.add_argument("--cwd", help="native engine working directory")
+    ap.add_argument("--log", help="native engine append-log path")
+    ap.add_argument("--alias", dest="model_name", help="API model name")
+    ap.add_argument("--lib-dir", action="append", help="native library directory (repeatable, order preserved)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -1674,7 +1771,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
-    ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
+    ap.add_argument("--tokenizer", default=None,
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
@@ -1685,18 +1782,21 @@ def main() -> int:
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
-    a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
-    if a.gpu is not None:
-        cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    ap.add_argument("engine_args", nargs=argparse.REMAINDER, help="native Strata arguments after --")
+    a = ap.parse_args(argv)
+    cfg = engine_config_from_args(ap, a)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+    a.tokenizer = cfg.get("tokenizer") or a.tokenizer or str(ROOT / "pack/full/tokenizer")
+    return ap, a, cfg
+
+
+def main(argv=None) -> int:
+    ap, a, cfg = parse_server_options(argv)
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
         ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
                  f"Close it, or start this one with a different --port")
-    if cfg.get("tokenizer"):
-        a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
@@ -1712,8 +1812,6 @@ def main() -> int:
         tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
-        if not cfg:
-            ap.error("--engine strata needs --config")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
@@ -1777,8 +1875,8 @@ def main() -> int:
         if not ips:
             print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
         if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+            print("       WARNING: no API key - anyone on your network can use this model. Pass --api-key KEY "
+                  "(or set api_key in a legacy config); clients send it as their API key.", flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "

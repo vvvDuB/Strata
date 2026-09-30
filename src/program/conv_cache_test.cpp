@@ -62,6 +62,31 @@ int main() {
         const size_t b = eviction_victim(stamps.data(), stamps.size(), 4);
         check(a == 1 && b == 1, "ties among equally stale leaves: the earlier index, deterministically");
     }
+    {
+        const std::vector<uint64_t> stamps = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+        check(eviction_victim(stamps.data(), stamps.size(), 12, 8) == 8,
+              "eight system-prefix checkpoints survive newer conversation leaves");
+        check(eviction_victim(stamps.data(), stamps.size(), 12, 13) == 10,
+              "a huge system still reserves two rotating slots within the memory cap");
+        check(eviction_victim(stamps.data(), stamps.size(), 2, 8) == 1,
+              "legacy two-slot profile still keeps root and recent leaf");
+    }
+    {
+        using strata::program::conv_cache::read_boundaries;
+        check(read_boundaries(0, 9000, 7000, 8995, -1, 2048) ==
+              std::vector<int64_t>({2048,4096,6144,7000,8192,8995,9000}),
+              "exact 2048-token boundaries even with prefill 4096");
+        check(read_boundaries(6144, 9000, 7000, 8995, -1, 2048) ==
+              std::vector<int64_t>({7000,8192,8995,9000}),
+              "after partial-prefix resume, grid remains absolute and root is saved");
+        check(read_boundaries(0, 9000, 7000, 8995, -1, 0) ==
+              std::vector<int64_t>({7000,8995,9000}),
+              "periodic checkpoints disabled keeps legacy boundaries");
+        check(read_boundaries(0, 4096, 2048, 4096, 2048, 2048) ==
+              std::vector<int64_t>({2048,4096}), "duplicate boundaries are saved only once");
+        check(read_boundaries(8192, 9000, 7000, 8995, -1, 2048) ==
+              std::vector<int64_t>({8995,9000}), "never go backwards on a resumed prompt");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
