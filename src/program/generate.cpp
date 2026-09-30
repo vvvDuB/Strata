@@ -15,6 +15,13 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/checkpoint_staging.hpp"
+#include "strata/core/checkpoint_cuda.hpp"
+#include "strata/core/conversation_memory.hpp"
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+#include "strata/platform/conversation_store.hpp"
+#endif
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -46,6 +53,12 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/checkpoint_records.hpp"
+#include "strata/program/request_stop.hpp"
+#include "strata/program/prefix_file.hpp"
+#include "strata/program/prefix_state.hpp"
+#include "strata/program/conversation_store.hpp"
+#include <filesystem>
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -75,6 +88,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <new>
 #include <charconv>
 #include <cmath>
 #include <limits>
@@ -84,6 +99,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <string>
 #include <set>
 #include <vector>
@@ -282,11 +298,21 @@ struct Options {
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    std::string prompt_cache_policy = "balanced"; // sparse coverage; lru keeps the legacy policy
+    int64_t conversation_ram_cache_mib = 0; // opt-in host RAM for independent conversations
+    int conversation_ram_cache_slots = 4;
+    int64_t conversation_ram_cache_min_free_mib = 2560;
+    std::string conversation_disk, conversation_tokenizer, conversation_template;
+    int64_t conversation_disk_mib = 0;
+    int conversation_disk_slots = 128;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
+    std::string prefix_cache_file; // optional persistent system-prefix cache; absent means no disk I/O
+    std::string conversation_cache_dir; // optional full positional + recurrent inactive branches
+    int64_t conversation_cache_mib = 8192, conversation_cache_slots = 4;
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
@@ -373,9 +399,22 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
+                 "  --prompt-cache-policy balanced|lru  checkpoint retention (default balanced)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
+                 "  --conversation-ram-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
+                 "  --conversation-ram-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-disk DIR  optional eviction-only disk tier (requires disk-enabled build)\n"
+                 "  --conversation-cache-disk-mib N  disk quota including temporary writes (default 0 = off)\n"
+                 "  --conversation-cache-disk-slots N  disk entry limit (default 128)\n"
+                 "  --conversation-cache-tokenizer DIR  tokenizer identity (default PACK/tokenizer)\n"
+                 "  --conversation-cache-template FILE  external chat template identity, when used\n"
+                 "  --conversation-ram-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prefix-cache-file PATH  opt-in persistent system prefix (resident INT8 KV; up to 8 variants)\n"
+                 "  --conversation-cache-dir DIR  opt-in private SSD backing for inactive text conversations\n"
+                 "  --conversation-cache-mib N    total disk budget (default 8192; max 65536)\n"
+                 "  --conversation-cache-slots N  disk branches (default 4; max 64); one active GPU branch\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -708,19 +747,8 @@ int argmax(const std::vector<float>& v) {
 //     back rejected drafts.
 // A checkpoint is only valid while the positional cells below it still hold ITS tokens, so the serve loop keeps
 // just the checkpoints that are prefixes of the tokens the session holds now.
-struct ImgKey {
-    int64_t start = 0;      ///< the image's first <|image_pad|> position
-    uint64_t hash = 0;      ///< its embeddings and grid: the pad tokens alone are the same for every picture
-    bool operator==(const ImgKey& o) const { return start == o.start && hash == o.hash; }
-};
-
-struct ConvCheckpoint {
-    std::vector<int32_t> ids;     ///< the tokens this state has consumed
-    std::vector<ImgKey> imgs;     ///< the images among them
-    std::vector<uint8_t> gdn, ple, tails;
-    uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
-    std::vector<ConvCheckpoint> stage_parts;   ///< a layer split's later stages: their sessions' running state
-};
+using ImgKey = strata::core::ConversationImageKey;
+using ConvCheckpoint = strata::core::ConversationCheckpoint;
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
@@ -728,52 +756,25 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
     return h;
 }
 
-struct ConvStateSizes {
-    size_t gdn = 0, ple = 0, tail = 0;
-};
+using ConvStateSizes = strata::core::ConversationStateSizes;
 
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     ConvStateSizes z;
-    z.gdn = (size_t) g.n_gdn_layers() *
-            ((size_t) g.ssm_state_size * (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size +
-             (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1)) * sizeof(float);
-    z.ple = (size_t) strata::kernels::NG_HIST * (size_t) strata::kernels::NG_HC_DIM * sizeof(float);
-    z.tail = (size_t) (strata::kernels::qsa_real_shapes().idx_block - 1) * (size_t) g.idx_key_dim * sizeof(float);
+    std::string error;
+    strata::core::conversation_state_sizes(g, z, error); // geometry has already passed engine validation
     return z;
 }
 
 /// Copies the running state out.  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
-    const ConvStateSizes z = conv_state_sizes(g);
-    c.gdn.resize(z.gdn);
-    c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
-    c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
-        return false;
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(c.tails.data() + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail, cudaMemcpyDeviceToHost) !=
-            cudaSuccess)
-            return false;
-    return true;
+    std::string error;
+    return strata::core::conversation_checkpoint_save(c, ss, g, error);
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
-    const ConvStateSizes z = conv_state_sizes(g);
-    if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
-        return false;
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(ss.qsa_states[i].idx_tail, c.tails.data() + (size_t) i * z.tail, z.tail, cudaMemcpyHostToDevice) !=
-            cudaSuccess)
-            return false;
-    // the PLE's token window is the last two tokens, OLDEST FIRST, -1 where there is none (as session_zero leaves it)
-    const size_t L = c.ids.size();
-    ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
-    ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    std::string error;
+    return strata::core::conversation_checkpoint_restore(c, ss, g, error);
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -1020,8 +1021,47 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--prompt-cache-policy") {
+            o.prompt_cache_policy = next("--prompt-cache-policy");
+            if (o.prompt_cache_policy != "balanced" && o.prompt_cache_policy != "lru") {
+                std::fprintf(stderr, "strata generate: --prompt-cache-policy must be balanced or lru\n");
+                return 2;
+            }
+        }
+        else if (a == "--conversation-cache-disk") o.conversation_disk = next(a.c_str());
+        else if (a == "--conversation-cache-tokenizer") o.conversation_tokenizer = next(a.c_str());
+        else if (a == "--conversation-cache-template") o.conversation_template = next(a.c_str());
+        else if (a == "--conversation-ram-cache-mib" || a == "--conversation-ram-cache-slots" ||
+                 a == "--conversation-ram-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
+                 a == "--conversation-cache-disk-slots") {
+            const std::string value = next(a.c_str());
+            int64_t parsed = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            const bool slots = a == "--conversation-ram-cache-slots" || a == "--conversation-cache-disk-slots";
+            const int64_t limit = slots ? INT32_MAX : INT64_MAX / (1024 * 1024);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 0 || parsed > limit) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-ram-cache-mib") o.conversation_ram_cache_mib = parsed;
+            else if (a == "--conversation-ram-cache-min-free-mib") o.conversation_ram_cache_min_free_mib = parsed;
+            else if (a == "--conversation-cache-disk-mib") o.conversation_disk_mib = parsed;
+            else if (a == "--conversation-cache-disk-slots") o.conversation_disk_slots = (int) parsed;
+            else o.conversation_ram_cache_slots = (int) parsed;
+        }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+        else if (a == "--prefix-cache-file") o.prefix_cache_file = next("--prefix-cache-file");
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots") {
+            int64_t value=0;
+            if (!strata::program::logits_selection::parse_stride(next(a.c_str()),value) ||
+                value>(a=="--conversation-cache-mib"?65536:64)) {
+                std::fprintf(stderr,"%s requires a positive integer within its limit\n",a.c_str());return 2;
+            }
+            if (a=="--conversation-cache-mib") o.conversation_cache_mib=value;
+            else o.conversation_cache_slots=value;
+        }
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -1086,6 +1126,24 @@ int main(int argc, char** argv) {
             // tokens would look like a working run.
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             usage();
+            return 2;
+        }
+    }
+    if (o.serve && o.conversation_ram_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_ram_cache_slots == 0))
+        std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+                     o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-ram-cache-slots 0");
+    if (o.conversation_ram_cache_mib > 0 && o.conversation_ram_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
+        std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-ram-cache-mib 0\n");
+        return 2;
+    }
+    const bool conversation_disk_enabled = o.conversation_disk_mib > 0 && o.conversation_disk_slots > 0;
+    if (conversation_disk_enabled) {
+#ifndef STRATA_ENABLE_CONVERSATION_DISK
+        std::fprintf(stderr, "strata serve: disk caching requires a build with STRATA_ENABLE_CONVERSATION_DISK=ON\n");
+        return 2;
+#endif
+        if (!o.serve || o.conversation_disk.empty() || !o.conversation_ram_cache_mib || !o.conversation_ram_cache_slots || !o.prompt_cache) {
+            std::fprintf(stderr, "strata serve: disk caching requires --serve, --conversation-cache-disk DIR and enabled RAM/prompt caching\n");
             return 2;
         }
     }
@@ -3261,57 +3319,396 @@ int main(int argc, char** argv) {
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
+        int64_t cache_anchor = 0;  // a learned exact fork boundary, only a retention hint
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
-        int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        int64_t pp_total = 0, pp_from = 0, pp_done = 0, pp_root_end = 0;
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+        strata::platform::ConversationStore conversation_disk;
+        if (conversation_disk_enabled) {
+            try {
+                namespace fs = std::filesystem;
+                std::vector<strata::platform::ConversationAsset> assets;
+                auto asset = [&](std::string role, const fs::path& path) { assets.push_back({std::move(role), path}); };
+                asset("pack/index", fs::path(o.pack) / "index.txt");
+                for (const char* name : {"dense.bin", "embd.bin", "experts.bin", "extra.bin", "native_experts.txt"}) {
+                    const auto path = fs::path(o.pack) / name;
+                    if (fs::exists(path)) asset(std::string("pack/") + name, path);
+                }
+                if (!o.native_preset.empty()) asset("native/embedding", o.native_preset);
+                if (!o.native_head_gguf.empty()) asset("native/head", o.native_head_gguf);
+                for (size_t i = 0; i < o.native_dense_gguf.size(); ++i)
+                    asset("native/dense/" + std::to_string(i), o.native_dense_gguf[i]);
+                // v3 native packs may source experts from additional named shards.
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                if (!fs::exists(fs::path(o.pack) / "experts.bin")) {
+                    for (size_t i = 0; i < layout.gguf_file.size(); ++i)
+                        if (!layout.gguf_file[i].empty())
+                            asset("native/experts/" + std::to_string(i), fs::path(o.native_preset).parent_path() / layout.gguf_file[i]);
+                }
+                if (!o.no_ple) asset("ple", o.ple_gguf);
+                for (const char* name : {"dense.txt", "dense.bin", "experts.bin"})
+                    asset(std::string("draft/") + name, fs::path(o.mtp) / name);
+                if (fs::exists(fs::path(o.mtp) / "draft_vocab.bin")) asset("draft/vocab", fs::path(o.mtp) / "draft_vocab.bin");
+                if (!o.expert_profile.empty()) asset("expert-profile", o.expert_profile);
+                for (size_t i = 0; i < o.cvec_files.size(); ++i) asset("steering/" + std::to_string(i), o.cvec_files[i].first);
+                const fs::path tokenizer = o.conversation_tokenizer.empty() ? fs::path(o.pack) / "tokenizer" : fs::path(o.conversation_tokenizer);
+                for (const char* name : {"vocab.json", "merges.txt", "token_type.json"}) asset(std::string("tokenizer/") + name, tokenizer / name);
+                if (fs::exists(tokenizer / "chat_template.jinja")) asset("tokenizer/template", tokenizer / "chat_template.jinja");
+                if (!o.conversation_template.empty()) asset("frontend/template", o.conversation_template);
+#ifdef _WIN32
+                std::vector<wchar_t> executable(32768);
+                const DWORD length = GetModuleFileNameW(nullptr, executable.data(), DWORD(executable.size()));
+                if (!length || length >= executable.size()) throw std::runtime_error("cannot identify engine executable");
+                asset("engine", fs::path(std::wstring(executable.data(), length)));
+#else
+                asset("engine", fs::read_symlink("/proc/self/exe"));
+#endif
+                std::ostringstream settings;
+                settings.imbue(std::locale::classic());
+                settings << "shared-image-v1 engine=" STRATA_VERSION "\n" << std::setprecision(17);
+                auto field = [&](const std::string& value) { settings << value.size() << ':' << value << '\n'; };
+                // Bind all inference flags, including experimental arithmetic flags.
+                // Retention/path knobs do not alter state and may change on restart.
+                for (int i = 1; i < argc; ++i) {
+                    const std::string arg = argv[i];
+                    if ((arg.rfind("--conversation-cache-", 0) == 0 || arg.rfind("--conversation-ram-cache-", 0) == 0)) { ++i; continue; }
+                    field(arg);
+                }
+                char** environment = nullptr;
+#ifdef _WIN32
+                if (_get_environ(&environment) != 0) throw std::runtime_error("cannot identify engine environment");
+#else
+                environment = environ;
+#endif
+                std::vector<std::string> environment_settings;
+                for (char** e = environment; e && *e; ++e)
+                    if (std::strncmp(*e, "STRATA_", 7) == 0) environment_settings.emplace_back(*e);
+                std::sort(environment_settings.begin(), environment_settings.end());
+                for (const auto& value : environment_settings) field(value);
+                if (const char* tuning = std::getenv("STRATA_HIPBLASLT_TUNING")) asset("hip/gemm-tuning", tuning);
+                for (const auto value : strata::core::conversation_geometry_key(g)) settings << value << ' ';
+                settings << "\nresolved " << o.prefill_chunk << ' ' << xcache.slots() << ' ' << o.pcie_frac << ' '
+                         << o.spec << ' ' << o.mtp_max_t << ' ' << o.mtp_window << ' ' << o.kv << ' ' << o.vision << '\n';
+                auto kv_identity = [&](const strata::core::QsaState& kv) {
+                    settings << kv.max_cells << ' ' << kv.n_slots << ' ' << kv.kv_mode << ' '
+                             << kv.kv_int8 << ' ' << kv.kv_q4 << ' ' << kv.kv_hybrid << '\n';
+                };
+                for (int64_t i = 0; i < g.n_qsa_layers(); ++i) kv_identity(ss.qsa_states[i]);
+                kv_identity(mtp.kv_state());
+                int device = 0, runtime = 0, driver = 0;
+                cudaDeviceProp properties{};
+                if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&properties, device) != cudaSuccess ||
+                    cudaRuntimeGetVersion(&runtime) != cudaSuccess || cudaDriverGetVersion(&driver) != cudaSuccess)
+                    throw std::runtime_error("cannot identify GPU runtime");
+                field(properties.name);
+                settings << properties.major << ' ' << properties.minor << ' ' << runtime << ' ' << driver << '\n';
+                strata::platform::ConversationIdentity identity;
+                std::string disk_error;
+                std::fprintf(stderr, "strata serve: disk cache: hashing complete model assets and runtime identity\n");
+                if (!strata::platform::conversation_identity(assets, settings.str(), identity, disk_error) ||
+                    !conversation_disk.open(o.conversation_disk, identity, uint64_t(o.conversation_disk_mib) * 1024 * 1024,
+                                            size_t(o.conversation_disk_slots), disk_error,
+                                            []() noexcept { strata::core::progress_beat(); }))
+                    throw std::runtime_error(disk_error);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata serve: disk cache initialization failed: %s\n", e.what());
+                return 1;
+            }
+        }
+        struct DiskSpill {
+            strata::platform::ConversationStore* store;
+            const strata::platform::ConversationStore::Candidate* protected_entry = nullptr;
+        } disk_spill{&conversation_disk};
+        auto spill = [](void* user, const strata::core::SavedConversation& image) noexcept {
+            auto& disk = *static_cast<DiskSpill*>(user);
+            if (!disk.store->is_open()) return;
+            strata::core::progress_at("spilling conversation snapshot", int64_t(image.live.ids.size()));
+            try {
+                const auto started = Clock::now();
+                std::string error;
+                uint64_t file_bytes = 0;
+                if (!strata::platform::conversation_file_size(image, file_bytes, error) ||
+                    !disk.store->put(image, error, disk.protected_entry))
+                    std::fprintf(stderr, "strata serve: disk cache: dropped eviction (%s)\n", error.c_str());
+                else std::fprintf(stderr, "strata serve: disk cache: spilled %zu tokens bytes=%llu in %.1f ms\n",
+                                  image.live.ids.size(), (unsigned long long) file_bytes,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+            } catch (...) { std::fprintf(stderr, "strata serve: disk cache: dropped eviction (allocation failure)\n"); }
+        };
+#endif
+        size_t conversation_ram_budget = o.prompt_cache > 0 ? (size_t) o.conversation_ram_cache_mib * 1024 * 1024 : 0;
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+        // Leave a fixed allowance for synchronous spill/probe codec workspace.
+        if (conversation_disk.is_open()) {
+            const size_t workspace = strata::platform::kConversationFileWorkspace;
+            if (conversation_ram_budget <= workspace) {
+                std::fprintf(stderr, "strata serve: RAM cache budget must exceed disk codec workspace\n");
+                return 2;
+            }
+            conversation_ram_budget -= workspace;
+        }
+#endif
+        strata::core::ConversationCache parked_conversations(
+            conversation_ram_budget,
+            (size_t) o.conversation_ram_cache_slots
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+            , spill, &disk_spill
+#endif
+        );
+        // Save only on a switch/rewind, not on each continuing request. No graph
+        // addresses change: all parked images live in ordinary host vectors.
+        auto park_current = [&](size_t held) -> bool {
+            if (!parked_conversations.enabled() || !live_ok || live.empty()) return true;
+            const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
+            auto reuse = parked_conversations.take_reuse();
+            size_t estimate = 0;
+            if (!strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, err)) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
+                err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
+                return true;
+            }
+            const size_t fresh_estimate = estimate;
+            if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
+                    reuse, view, ss, g, mtp.kv_state(), estimate, err)) {
+                reuse = {};
+                estimate = fresh_estimate;
+                err.clear();
+            }
+            if (!reuse.kv.empty() && !parked_conversations.can_fit(estimate, held)) {
+                // Optional growth capacity must not evict useful conversations.
+                reuse = {};
+                estimate = fresh_estimate;
+            }
+            if (!parked_conversations.make_room(estimate, held)) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                             estimate >> 20);
+                return true;
+            }
+            const auto t0 = Clock::now();
+            try {
+                const uint64_t floor = (uint64_t) o.conversation_ram_cache_min_free_mib * 1024 * 1024;
+                const size_t additional = estimate - reuse.bytes();
+                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                        additional, floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
+                                 additional >> 20, (long long) o.conversation_ram_cache_min_free_mib);
+                    return true;
+                }
+                strata::core::SavedConversation image;
+                size_t reused_bytes = 0;
+                if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err,
+                        std::move(reuse), &reused_bytes)) return false;
+                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
+                    return true;
+                }
+                const size_t snapshot_bytes = image.bytes();
+                const bool stored = parked_conversations.put(std::move(image), held);
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                             stored ? "parked" : "skipped", live.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             parked_conversations.size(), parked_conversations.bytes(), parked_conversations.evictions(), snapshot_bytes, reused_bytes);
+            } catch (const std::bad_alloc&) {
+                // The active state has not been touched. Continue with normal
+                // prompt processing rather than killing a serving process.
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+            }
+            return true;
+        };
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
             return v;
         };
+        // Disk snapshots are an optional backing store, not a replacement for the live prefix chain.
+        struct DiskPrefix { std::string path; strata::program::PrefixFile meta; };
+        std::vector<DiskPrefix> disk_prefixes;
+        std::set<uint64_t> disk_attempted;
+        std::string disk_identity;
+        strata::program::ConversationStore conversations;
+        const bool conversation_cache = !o.conversation_cache_dir.empty();
+        if (!o.prefix_cache_file.empty() || conversation_cache) {
+            if (multi_gpu || o.kv != "int8" || o.kv_resident != 0 || o.prompt_cache < 1 || o.prompt_cache_root < 1 ||
+                o.mtp.empty() || !o.cvec_files.empty() || o.vision) {
+                std::fprintf(stderr, "strata disk cache: requires single-GPU resident INT8 KV, MTP, prompt cache/root; no vision/control vectors\n");
+                return 1;
+            }
+            try {
+                std::ostringstream key;
+                key << "prefix-v2|" << __DATE__ << '|' << __TIME__ << "|slots=" << xcache.slots();
+                if (std::filesystem::exists("/proc/self/exe"))
+                    key << "|exe=" << std::filesystem::file_size("/proc/self/exe") << ':'
+                        << std::filesystem::last_write_time("/proc/self/exe").time_since_epoch().count();
+                for (int i=1;i<argc;++i) {
+                    const std::string arg=argv[i];
+                    if (arg=="--prefix-cache-file" || arg=="--conversation-cache-dir" ||
+                        arg=="--conversation-cache-mib" || arg=="--conversation-cache-slots") {++i;continue;}
+                    key << '|' << argv[i];
+                }
+                std::set<std::string> files = {o.pack+"/dense.bin", o.pack+"/experts.bin", o.pack+"/index.txt",
+                    o.pack+"/native_experts.txt", o.mtp+"/dense.bin", o.mtp+"/dense.txt", o.mtp+"/experts.bin",
+                    o.mtp+"/draft_vocab.bin", o.native_preset, o.native_head_gguf, o.ple_gguf, o.expert_profile};
+                for (const auto& f:o.native_dense_gguf) files.insert(f);
+                for (const auto& f:files) if (!f.empty() && std::filesystem::is_regular_file(f))
+                    key << '|' << std::filesystem::absolute(f).string() << ':' << std::filesystem::file_size(f)
+                        << ':' << std::filesystem::last_write_time(f).time_since_epoch().count();
+                disk_identity=key.str();
+                const std::filesystem::path base=std::filesystem::absolute(o.prefix_cache_file.empty()?".":o.prefix_cache_file);
+                if (!o.prefix_cache_file.empty() && std::filesystem::exists(base.parent_path())) {
+                    for (const auto& e:std::filesystem::directory_iterator(base.parent_path())) {
+                        const auto name=e.path().filename().string(), stem=base.filename().string();
+                        if (name!=stem && !(name.rfind(stem+".",0)==0 && e.path().extension()==".bin")) continue;
+                        strata::program::PrefixFile meta; std::string why;
+                        if (strata::program::prefix_read(e.path().string(),meta,true,why) && meta.identity==disk_identity)
+                            disk_prefixes.push_back({e.path().string(),std::move(meta)});
+                        if (disk_prefixes.size()>=8) break;
+                    }
+                }
+                std::fprintf(stderr,"strata prefix cache: indexed %zu compatible disk variants\n",disk_prefixes.size());
+                if (conversation_cache) {
+                    std::string why;
+                    if (!conversations.open(o.conversation_cache_dir,"conversation-v2|"+disk_identity,
+                            (size_t)o.conversation_cache_slots,(uint64_t)o.conversation_cache_mib<<20,why))
+                        throw std::runtime_error(why);
+                    std::fprintf(stderr,"strata conversation cache: indexed %zu branches, %llu MiB, limit=%lld MiB/%lld slots\n",
+                        conversations.size(),(unsigned long long)(conversations.bytes()>>20),
+                        (long long)o.conversation_cache_mib,(long long)o.conversation_cache_slots);
+                }
+            } catch(const std::exception& e) {
+                std::fprintf(stderr,"strata prefix cache: initialization failed: %s\n",e.what()); return 1;
+            }
+        }
+        // #203's useful part: stream-ordered pinned transfer, opt-in. Keep
+        // root/turn/fork boundaries synchronous and the fork's retention policy.
+        // There was no measurable speedup in #203's current-main A/B. Avoid a
+        // background copier: one pending checkpoint owns its recycled buffers,
+        // and only the serve thread publishes it after the CUDA event completes.
+        auto env_one = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && std::strcmp(value, "1") == 0;
+        };
+        const bool checkpoint_async = !multi_gpu && env_one("STRATA_CK_ASYNC") && !env_one("STRATA_CK_SYNC");
+        ConvCheckpoint pending_checkpoint; // outlives the capture's DMA drain
+        strata::core::CheckpointCudaTransport checkpoint_transport(main_stream);
+        strata::core::CheckpointStaging<strata::core::CheckpointCudaTransport> checkpoint_capture(checkpoint_transport);
+        auto checkpoint_join = [&]() -> bool {
+            if (!checkpoint_capture.pending()) return true;
+            std::string why;
+            if (!checkpoint_capture.finish(why)) {
+                std::fprintf(stderr, "strata serve: %s\n", why.c_str()); return false;
+            }
+            pending_checkpoint.used = ++check_clock;
+            checks.push_back(std::move(pending_checkpoint));
+            return true;
+        };
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
-        // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
-        // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
-        // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
-        std::mutex part_mu;
-        std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
-        std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
-        // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
-        // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+        // Exact-boundary reads below finish and join all prefill stages before checkpointing.
+        // Thus every stage is at L; no asynchronously assembled mid-chunk checkpoint is needed.
+        auto checkpoint_at = [&](int64_t L, bool periodic_only) -> bool {
+            if (!checkpoint_join()) return false;
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
+            if ((int) checks.size() >= o.prompt_cache) {
+                // Decide on metadata BEFORE copying ~118 MB. Recycle the victim's buffers so
+                // a full cache does not temporarily allocate an extra checkpoint every 2048 tokens.
+                std::vector<int64_t> positions;
+                std::vector<uint64_t> stamps;
+                size_t prefix_count = 0;
+                for (const ConvCheckpoint& k : checks) {
+                    positions.push_back((int64_t) k.ids.size()); stamps.push_back(k.used);
+                    if ((int64_t) k.ids.size() <= pp_root_end) ++prefix_count;
+                }
+                positions.push_back(L); stamps.push_back(check_clock + 1);
+                if (L <= pp_root_end) ++prefix_count;
+                const size_t victim = o.prompt_cache_policy == "balanced"
+                    ? strata::program::conv_cache::balanced_eviction_victim(positions, o.prompt_cache,
+                                                                           pp_root_end, cache_anchor)
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+                                                                  o.prompt_cache, prefix_count);
+                if (victim == checks.size()) return true;
+                c = std::move(checks[victim]);
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+            }
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (parts != nullptr) {
-                if (parts->size() != stages.size() + 1) return false;
-                c.gdn = std::move((*parts)[0].gdn);
-                c.ple = std::move((*parts)[0].ple);
-                c.tails = std::move((*parts)[0].tails);
-                for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
-            } else {
-                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
-                for (auto& st : stages) {   // a layer split's later stages: their sessions' part
-                    const strata::core::OnDevice on(st->dev);
-                    ConvCheckpoint part;
-                    if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(part, st->ss, g)) return false;
-                    c.stage_parts.push_back(std::move(part));
+            c.stage_parts.clear();  // an evicted buffer can belong to a previous checkpoint
+            if (checkpoint_async && periodic_only) {
+                std::string why;
+                if (!strata::core::conversation_checkpoint_prepare(c, ss, g, why)) {
+                    std::fprintf(stderr, "strata serve: %s\n", why.c_str()); return false;
                 }
+                pending_checkpoint = std::move(c);
+                auto& pending = pending_checkpoint;
+                const ConvStateSizes z = conv_state_sizes(g);
+                std::vector<strata::core::CheckpointCopy> spans{
+                    {ss.gdn_state, pending.gdn.data(), pending.gdn.size()},
+                    {ss.ple_hist, pending.ple.data(), pending.ple.size()}};
+                for (size_t i = 0; i < (size_t) g.n_qsa_layers(); ++i) {
+                    spans.push_back({ss.qsa_states[i].idx_tail, pending.tails.data() + i * z.tail, z.tail});
+                    spans.push_back({ss.qsa_states[i].idx_dead, pending.dead.data() + i * z.dead, z.dead});
+                    spans.push_back({ss.qsa_states[i].idx_block_pos, pending.block_pos.data() + i * z.block_pos, z.block_pos});
+                }
+                const auto result = checkpoint_capture.enqueue(std::move(spans), why);
+                if (result == strata::core::CheckpointEnqueue::queued) return true;
+                if (result == strata::core::CheckpointEnqueue::failed) {
+                    std::fprintf(stderr, "strata serve: %s\n", why.c_str()); return false;
+                }
+                // Allocation failure happens before any transfer: safely use
+                // the original synchronous path with the same owned buffers.
+                c = std::move(pending_checkpoint);
+                std::fprintf(stderr, "strata serve: pinned checkpoint unavailable (%s); synchronous fallback\n", why.c_str());
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            for (auto& st : stages) {
+                const strata::core::OnDevice on(st->dev);
+                ConvCheckpoint part;
+                part.ids = c.ids;
+                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(part, st->ss, g)) return false;
+                c.stage_parts.push_back(std::move(part));
             }
             c.used = ++check_clock;
             checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) {
-                std::vector<uint64_t> stamps;
-                stamps.reserve(checks.size());
-                for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
-                                                                                   o.prompt_cache);
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
-            }
+            std::fprintf(stderr, "strata serve: checkpoint saved position=%lld system_end=%lld retained=%zu\n",
+                         (long long) L, (long long) pp_root_end, checks.size());
             return true;
+        };
+        auto persist_system = [&](int64_t L) {
+            if (o.prefix_cache_file.empty() || !req_imgs.empty() || L<1 || disk_prefixes.size()>=8 ||
+                !strata::program::prefix_is_system(cur)) return;
+            strata::program::PrefixFile f;
+            f.identity=disk_identity;
+            f.tokens.assign(cur.begin(),cur.begin()+L);
+            for (const auto& entry:disk_prefixes) if (entry.meta.tokens==f.tokens) return;
+            const uint64_t hash=strata::program::prefix_hash(f.tokens.data(),f.tokens.size()*4) ^
+                                strata::program::prefix_hash(disk_identity.data(),disk_identity.size());
+            if (!disk_attempted.insert(hash).second) return;
+            for (const auto& c:checks) if ((int64_t)c.ids.size()<=L) {
+                f.positions.push_back(c.ids.size());
+                strata::program::checkpoint_records::append(f.blobs, c);
+            }
+            std::string why;
+            if (f.positions.empty() || f.positions.back()!=(uint64_t)L ||
+                !strata::program::prefix_state_capture(ss,g,mtp,L,f.blobs,why)) {
+                std::fprintf(stderr,"strata prefix cache: capture skipped: %s\n",why.c_str());return;
+            }
+            std::string path=o.prefix_cache_file;
+            std::error_code path_error;
+            const bool exists=std::filesystem::exists(path,path_error);
+            if (path_error) {
+                std::fprintf(stderr,"strata prefix cache: save skipped: %s\n",path_error.message().c_str());return;
+            }
+            if (exists) path+="."+std::to_string(hash)+".bin";
+            if (!strata::program::prefix_write(path,f,why)) {
+                std::fprintf(stderr,"strata prefix cache: save skipped: %s\n",why.c_str());return;
+            }
+            f.blobs.clear();
+            disk_prefixes.push_back({path,std::move(f)});
+            std::fprintf(stderr,"strata prefix cache: saved %lld system tokens, %zu checkpoints -> %s\n",
+                         (long long)L,disk_prefixes.back().meta.positions.size(),path.c_str());
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
@@ -3319,53 +3716,23 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
+                std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
+                             batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
+            pp_done = done;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            if (o.prompt_cache_every > 0 && done >= pp_next_check) {
-                bool saved = false;
-                if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
-                    std::vector<ConvCheckpoint> parts;
-                    {
-                        std::lock_guard<std::mutex> lk(part_mu);
-                        auto it = part_at.find(done);
-                        if (it != part_at.end()) parts = std::move(it->second);
-                        part_at.erase(part_at.begin(), part_at.upper_bound(done));
-                    }
-                    bool complete = parts.size() == stages.size() + 1;
-                    for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
-                    saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
-                } else {
-                    saved = checkpoint_at(done);
-                }
-                if (!saved) { e = "saving a conversation checkpoint failed"; return false; }
-                pp_next_check = done + o.prompt_cache_every;
-            }
             return true;
         };
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
-            for (size_t i = 0; i <= stages.size(); ++i) {
-                strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
-                strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
-                stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
-                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
-                    ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
-                    std::lock_guard<std::mutex> lk(part_mu);
-                    auto& v = part_at[done];
-                    v.resize(stages.size() + 1);
-                    v[i] = std::move(part);
-                    return true;
-                };
-            }
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
@@ -3458,11 +3825,19 @@ int main(int argc, char** argv) {
             return true;
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
-        // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-        std::atomic<bool> stop_req{false};
+        // away, or pressed Esc): check between prompt layers/chunks and verify windows.
+        strata::program::RequestStop stop_req;
+        uint64_t request_ticket = stop_req.ticket();
+        auto stop_requested = [&] { return stop_req.requested(request_ticket); };
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+        conversation_disk.set_progress([&] {
+            if (stop_requested()) throw std::runtime_error("cancelled");
+            strata::core::progress_beat();
+        });
+#endif
         std::mutex in_mu;
         std::condition_variable in_cv;
-        std::deque<std::string> in_lines;
+        std::deque<std::pair<std::string, uint64_t>> in_lines;
         bool in_eof = false;
         std::thread([&] {
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
@@ -3495,9 +3870,9 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
+                if (l == "STOP") { stop_req.signal(); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
-                in_lines.push_back(l);
+                in_lines.emplace_back(l, stop_req.ticket());
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
@@ -3508,11 +3883,77 @@ int main(int argc, char** argv) {
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
+            out = std::move(in_lines.front().first);
+            request_ticket = in_lines.front().second;
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        sp.should_stop = stop_requested;
+        for (auto& st : stages) st->sp.should_stop = stop_requested;
+
+        // Save only before a destructive rewind/switch, never on the live append fast path.
+        // Capture through the deepest PREFILL checkpoint: final decode windows may not have
+        // populated all MTP cells. The last generated reply is deliberately re-read on return.
+        auto save_conversation = [&](const std::string& protected_path) {
+            if (!conversation_cache || checks.empty() || stop_requested()) return;
+            for (const auto& c:checks) if (!c.imgs.empty()) return;
+            if (conversations.contains(checks.back().ids)) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: identical snapshot already stored\n");
+                return;
+            }
+            const auto start=Clock::now();
+            strata::program::PrefixFile f;
+            f.identity="conversation-v2|"+disk_identity;f.tokens=checks.back().ids;
+            const uint64_t limit=std::min(strata::program::kConversationMaxBytes,
+                                          (uint64_t)o.conversation_cache_mib<<20);
+            uint64_t recurrent_bytes=0;
+            for (const auto& c:checks) recurrent_bytes+=c.gdn.size()+c.ple.size()+c.tails.size()+c.dead.size()+c.block_pos.size();
+            // Leave room for file metadata and bound temporary staging in addition to resident checkpoints.
+            if (limit<4*1024*1024 || recurrent_bytes>limit-4*1024*1024) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: staging budget\n");return;
+            }
+            for (const auto& c:checks) {
+                if (stop_requested()) return;
+                f.positions.push_back(c.ids.size());
+                strata::program::checkpoint_records::append(f.blobs, c);
+            }
+            std::string why;
+            if (!strata::program::prefix_state_capture(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,why,
+                                                       stop_requested,limit-4*1024*1024) ||
+                !conversations.put(f,protected_path,why,stop_requested)) {
+                std::fprintf(stderr,"strata conversation cache: save skipped: %s\n",why.c_str());return;
+            }
+            std::fprintf(stderr,"strata conversation cache: saved tokens=%zu checkpoints=%zu branches=%zu disk_mib=%llu evictions=%llu ms=%.0f\n",
+                f.tokens.size(),f.positions.size(),conversations.size(),(unsigned long long)(conversations.bytes()>>20),
+                (unsigned long long)conversations.evictions(),
+                std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+        };
+        auto snapshot_valid = [&](const strata::program::PrefixFile& f,const std::string& identity,std::string& why) {
+            const ConvStateSizes z=conv_state_sizes(g);
+            const size_t layers = (size_t) g.n_qsa_layers();
+            bool valid=f.identity==identity && !f.positions.empty() && f.positions.size()<=(size_t)o.prompt_cache &&
+                !f.tokens.empty() && f.positions.back()==f.tokens.size() &&
+                strata::program::checkpoint_records::valid(f.blobs, f.positions.size(),
+                    {z.gdn, ss.ple_hist ? z.ple : 0, z.tail * layers, z.dead * layers, z.block_pos * layers});
+            if (!valid) {why="snapshot identity or recurrent dimensions mismatch";return false;}
+            return strata::program::prefix_state_validate(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,strata::program::checkpoint_records::count*f.positions.size(),why);
+        };
+        auto restore_snapshot = [&](strata::program::PrefixFile& f,int64_t at,std::string& why) {
+            parked_conversations.limit_reuse(0);
+            strata::core::session_zero(ss,g,nullptr,main_cs);
+            cudaStreamSynchronize(main_stream);
+            if (!strata::program::prefix_state_restore(ss,g,mtp,(int64_t)f.tokens.size(),f.blobs,strata::program::checkpoint_records::count*f.positions.size(),why))
+                return false;
+            checks.clear();live_ok=false;
+            for (size_t i=0;i<f.positions.size();++i) if ((int64_t)f.positions[i]<=at) {
+                ConvCheckpoint c;c.ids.assign(f.tokens.begin(),f.tokens.begin()+f.positions[i]);
+                if (!strata::program::checkpoint_records::take(f.blobs, i, c)) {
+                    why = "truncated v2 checkpoint record"; return false;
+                }
+                c.used=++check_clock;checks.push_back(std::move(c));
+            }
+            return true; // normal checkpoint_restore below restores the recurrence at `at`.
+        };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -3542,14 +3983,18 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
+                        "spec_min_p=%.2f conversation_ram_cache_mib=%lld conversation_ram_cache_slots=%d "
+                        "conversation_ram_cache_min_free_mib=%lld conversation_disk_mib=%lld conversation_disk_slots=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
-                        o.spec_min_p);
+                        o.spec_min_p, (long long) o.conversation_ram_cache_mib, o.conversation_ram_cache_slots,
+                        (long long) o.conversation_ram_cache_min_free_mib,
+                        (long long) (conversation_disk_enabled ? o.conversation_disk_mib : 0),
+                        conversation_disk_enabled ? o.conversation_disk_slots : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -3602,7 +4047,6 @@ int main(int argc, char** argv) {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
-            stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
@@ -3777,38 +4221,279 @@ int main(int argc, char** argv) {
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
-            auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
-                const int64_t L = (int64_t) pre.size();
-                if (L < 1 || L > n - 1) return false;
-                for (int64_t i = 0; i < L; ++i)
-                    if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+            auto image_match = [&](int64_t L, const std::vector<ImgKey>& pre_imgs) -> bool {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            // the control vector for this request.  The live session and the checkpoints were read one way, so a
-            // switch reads the prompt again from the start
-            if (strata::kernels::cvec().loaded()) {
-                const bool want = req_cvec != 0;
-                if (want != cvec_cached) {
-                    live_ok = false;
-                    checks.clear();
-                    cvec_cached = want;
-                }
-                strata::kernels::cvec_set_enabled(want);
-            }
+            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            int64_t checkpoint_common = (checks.empty() || want_cvec != cvec_cached) ? 0 :
+                strata::program::conv_cache::common_prefix(checks.back().ids, ids);
+            const int64_t live_common = live_ok && want_cvec == cvec_cached ? strata::program::conv_cache::common_prefix(live, ids) : 0;
+            const int64_t previous_end = live_ok ? (int64_t) live.size() :
+                (checks.empty() ? 0 : (int64_t) checks.back().ids.size());
+            const int64_t previous_common = live_ok ? live_common : checkpoint_common;
+            auto checkpoint_matches = [&](const ConvCheckpoint& c) {
+                const int64_t L = (int64_t) c.ids.size();
+                return L > 0 && L < n && L <= checkpoint_common && image_match(L, c.imgs);
+            };
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0) {
-                if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+                if (live_ok && !live.empty() && (int64_t) live.size() < n &&
+                    live_common == (int64_t) live.size() && image_match(live_common, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+                    if ((int64_t) c.ids.size() > resume && checkpoint_matches(c)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
             }
+            // Select before spilling, so the incoming snapshot cannot be evicted by the outgoing one.
+            auto branch_hit=conversation_cache ? conversations.find(ids,resume) : strata::program::ConversationHit{};
+            int64_t legacy_prefix_resume = resume;
+            if (!o.prefix_cache_file.empty() && req_imgs.empty())
+                for (const auto& entry : disk_prefixes)
+                    legacy_prefix_resume = std::max(legacy_prefix_resume, strata::program::prefix_match(entry.meta, ids));
+            const int64_t old_branch_end=checks.empty()?0:(int64_t)checks.back().ids.size();
+            const int64_t old_root_before=checks.empty()?0:(int64_t)checks.front().ids.size();
+            const int64_t common_before=checkpoint_common;
+            if (conversation_cache && resume<old_branch_end) save_conversation(branch_hit.path);
+            // A STOP during cache I/O leaves the previous GPU branch intact and releases the FIFO promptly.
+            auto finish_cache_cancel = [&] {
+                if (!stop_requested()) return false;
+                const double ms=std::chrono::duration<double,std::milli>(Clock::now()-r0).count();
+                std::fprintf(stderr,"strata cache: cancelled before prefill; checkpoints preserved=%zu\n",checks.size());
+                std::printf("DONE 0 %lld %.1f 0 cancel 0 0 0 0 0\n",(long long)n,ms);std::fflush(stdout);return true;
+            };
+            if (finish_cache_cancel()) continue;
+            const char* restore_source=nullptr;
+            int64_t disk_common = 0;
+            auto parked = parked_conversations.best(ids, req_imgs, want_cvec);
+            auto selected = parked;
+            std::optional<strata::core::SavedConversation> incoming;
+            bool incoming_from_disk = false;
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+            strata::platform::ConversationStore::Candidate disk_hit;
+            if (conversation_disk.is_open()) {
+                strata::core::progress_at("selecting disk conversation prefix");
+                try {
+                    std::string disk_error;
+                    const uint64_t floor = uint64_t(o.conversation_ram_cache_min_free_mib) * 1024 * 1024;
+                    if (!conversation_disk.best(ids, req_imgs, want_cvec, conversation_ram_budget, {}, disk_hit, disk_error)) {
+                        std::fprintf(stderr, "strata serve: disk cache: lookup skipped (%s)\n", disk_error.c_str());
+                    } else if (disk_hit.match.tokens > std::max(resume, parked.tokens)) {
+                        const auto started = Clock::now();
+                        disk_spill.protected_entry = &disk_hit;
+                        if (parked_conversations.make_staging_room(size_t(disk_hit.match.staging_bytes))) {
+                            incoming.emplace();
+                            strata::core::progress_at("reading conversation snapshot", int64_t(disk_hit.match.staging_bytes));
+                            if (!conversation_disk.read(disk_hit, conversation_ram_budget,
+                                    strata::core::conversation_available_memory(), floor, *incoming, disk_error) ||
+                                !strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
+                                std::fprintf(stderr, "strata serve: disk cache: promotion skipped (%s)\n",
+                                             disk_error.empty() ? "physical RAM floor after staging" : disk_error.c_str());
+                                incoming.reset();
+                            }
+                        }
+                        // Staging admission can evict RAM entries. Never use an
+                        // index or score selected before those evictions.
+                        parked = parked_conversations.best(ids, req_imgs, want_cvec);
+                        if (incoming) {
+                            const auto loaded = strata::core::ConversationCache::match_image(*incoming, ids, req_imgs, want_cvec);
+                            uint64_t file_bytes = 0;
+                            if (loaded.tokens <= std::max(resume, parked.tokens) ||
+                                !strata::core::conversation_snapshot_validate(*incoming, ss, g, mtp.kv_state(), disk_error) ||
+                                !strata::platform::conversation_file_size(*incoming, file_bytes, disk_error)) {
+                                std::fprintf(stderr, "strata serve: disk cache: invalid or stale candidate (%s)\n", disk_error.c_str());
+                                incoming.reset();
+                            } else {
+                                strata::program::conv_cache::rebase_stamps(incoming->checkpoints);
+                                selected = loaded; incoming_from_disk = true;
+                                std::fprintf(stderr, "strata serve: disk cache: loaded %lld tokens bytes=%llu staging=%llu in %.1f ms\n",
+                                             (long long) loaded.tokens, (unsigned long long) file_bytes,
+                                             (unsigned long long) disk_hit.match.staging_bytes,
+                                             std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+                            }
+                        }
+                    }
+                } catch (const std::bad_alloc&) {
+                    incoming.reset();
+                    parked = parked_conversations.best(ids, req_imgs, want_cvec);
+                    std::fprintf(stderr, "strata serve: disk cache: promotion skipped (allocation failure)\n");
+                }
+                if (!incoming_from_disk) disk_spill.protected_entry = nullptr;
+            }
+#endif
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+            if (stop_requested()) disk_spill.protected_entry = nullptr;
+#endif
+            if (finish_cache_cancel()) continue;
+            if (!incoming && parked.tokens > resume) {
+                selected = parked;
+                incoming.emplace(parked_conversations.take(parked.index));
+            }
+            // Reject the entire image before parking/overwriting the outgoing
+            // state. Invalid entries can safely fall back to its existing prefix.
+            if (incoming && !incoming_from_disk &&
+                !strata::core::conversation_snapshot_validate(*incoming, ss, g, mtp.kv_state(), err)) {
+                std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
+                incoming.reset();
+                err.clear();
+            }
+            // Preserve the outgoing branch before any checkpoint rewind, reset,
+            // or incoming restore overwrites the positional state it requires.
+            if ((!from_live || incoming || branch_hit.position > resume || legacy_prefix_resume > resume) && !park_current(incoming ? incoming->bytes() : 0)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+            if (stop_requested()) disk_spill.protected_entry = nullptr;
+#endif
+            if (finish_cache_cancel()) continue;
+            if (incoming) {
+                const auto t0 = Clock::now();
+                if (strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err) !=
+                    strata::core::ConversationRestore::restored) {
+                    // Already prevalidated above: a failure here is fatal, never
+                    // permission to decode from a partially restored session.
+                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                    return 1;
+                }
+                if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                    uint64_t draft_hash = 0;
+                    if (!strata::core::conversation_kv_verify(incoming->kv.back(), mtp.kv_state(), g,
+                            int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
+                        std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
+                                 (unsigned long long) draft_hash, (long long) incoming->kv.back().cells,
+                                 mtp.kv_state().kv_mode, incoming_from_disk ? "disk" : "ram",
+                                 (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
+                }
+                disk_common = strata::program::conv_cache::common_prefix(incoming->live.ids, ids);
+                restore_source = incoming_from_disk ? "snapshot-disk" : "conversation-ram";
+                live_ok = true;
+                live = std::move(incoming->live.ids);
+                live_imgs = std::move(incoming->live.imgs);
+                checks = std::move(incoming->checkpoints);
+                // Disk checkpoints can predate this process's LRU clock.
+                for (const auto& checkpoint : checks) check_clock = std::max(check_clock, checkpoint.used);
+                cvec_cached = incoming->cvec;
+                resume = selected.tokens;
+                from_live = selected.live;
+#ifdef STRATA_ENABLE_CONVERSATION_DISK
+                if (incoming_from_disk) {
+                    std::string disk_error;
+                    if (!conversation_disk.touch(disk_hit, disk_error))
+                        std::fprintf(stderr, "strata serve: disk cache: cannot update retention time (%s)\n", disk_error.c_str());
+                }
+                disk_spill.protected_entry = nullptr;
+#endif
+                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
+                    parked_conversations.retain(std::move(incoming->kv), int64_t(live.size()));
+                incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu source=%s\n",
+                             (long long) resume, from_live ? "live" : "checkpoint",
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             parked_conversations.size(), parked_conversations.bytes(), incoming_from_disk ? "disk" : "ram");
+            }
+            if (want_cvec != cvec_cached) {
+                live_ok = false;
+                checks.clear();
+                cvec_cached = want_cvec;
+            }
+            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            if (finish_cache_cancel()) continue;
+            if (restore_source) {
+                checkpoint_common = checks.empty() ? 0 :
+                    strata::program::conv_cache::common_prefix(checks.back().ids, ids);
+                cache_anchor = 0;
+            }
+            if (branch_hit.position>resume) {
+                const auto start=Clock::now();
+                strata::program::PrefixFile f;std::string why;
+                if (conversations.load(branch_hit,f,why,stop_requested) &&
+                    snapshot_valid(f,"conversation-v2|"+disk_identity,why)) {
+                    if (!restore_snapshot(f,branch_hit.position,why)) {
+                        std::printf("ERR conversation cache CUDA restore failed: %s\n",why.c_str());return 1;
+                    }
+                    disk_common = strata::program::conv_cache::common_prefix(f.tokens, ids);
+                    resume=branch_hit.position;from_live=false;restore_source="conversation-disk";
+                    std::fprintf(stderr,"strata conversation cache: restored tokens=%lld ms=%.0f\n",(long long)resume,
+                        std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+                } else {
+                    if (why!="cancelled") conversations.discard(branch_hit.path);
+                    std::fprintf(stderr,"strata conversation cache: restore skipped: %s\n",why.c_str());
+                }
+            }
+            // A system-only disk match is used only when better than both RAM and a full branch.
+            if (!o.prefix_cache_file.empty() && req_imgs.empty() && !stop_requested()) {
+                size_t pick=disk_prefixes.size(); int64_t disk_resume=resume;
+                for (size_t i=0;i<disk_prefixes.size();++i) {
+                    const int64_t match=strata::program::prefix_match(disk_prefixes[i].meta,ids);
+                    if (match>disk_resume) {disk_resume=match;pick=i;}
+                }
+                if (pick<disk_prefixes.size()) {
+                    strata::program::PrefixFile f; std::string why;
+                    const bool valid=strata::program::prefix_read(disk_prefixes[pick].path,f,false,why) &&
+                        f.tokens==disk_prefixes[pick].meta.tokens && f.positions==disk_prefixes[pick].meta.positions &&
+                        snapshot_valid(f,disk_identity,why);
+                    if (!valid) {
+                        std::fprintf(stderr,"strata prefix cache: rejected snapshot (%s); normal prefill\n",why.c_str());
+                        disk_prefixes.erase(disk_prefixes.begin()+(std::ptrdiff_t)pick);
+                    } else {
+                        if (!restore_snapshot(f,disk_resume,why)) {
+                            std::printf("ERR prefix cache CUDA restore failed: %s\n",why.c_str());return 1;
+                        }
+                        disk_common = strata::program::conv_cache::common_prefix(f.tokens, ids);
+                        resume=disk_resume;from_live=false;restore_source="system-disk";
+                        std::fprintf(stderr,"strata prefix cache: restored %lld tokens from disk\n",(long long)resume);
+                    }
+                }
+            }
+            if (finish_cache_cancel()) continue;
+            if (conversation_cache) {
+                std::fprintf(stderr,"strata conversation cache: match=%lld old_branch=%lld common=%lld cause=%s\n",
+                    (long long)resume,(long long)old_branch_end,(long long)common_before,
+                    old_branch_end==0?"cold":common_before<old_root_before?"prefix-changed":
+                    common_before<old_branch_end?"conversation-fork":"append-or-tail");
+            }
+            if (restore_source) {
+                checkpoint_common = checks.empty() ? 0 :
+                    strata::program::conv_cache::common_prefix(checks.back().ids, ids);
+                cache_anchor = 0;
+            }
+            // Learn the exact common-prefix boundary after an edit/truncation. Replaying up to
+            // it reconstructs the recurrence correctly; never reuse state AFTER a changed token.
+            // Vision keeps the existing image-aware path (token-only LCP is not sufficient there).
+            int64_t fork_at = -1;
+            if (o.prompt_cache > 0 && req_imgs.empty() && live_imgs.empty() &&
+                previous_common > 0 && previous_common < previous_end) {
+                cache_anchor = std::min<int64_t>(previous_common, n - 1);
+                if (cache_anchor > resume) fork_at = cache_anchor;
+            } else if (resume == 0 || cache_anchor > resume) {
+                cache_anchor = 0;
+            }
+            const int64_t common_tokens = std::max({resume, previous_common, checkpoint_common, disk_common});
+            const int64_t checkpoint_gap = std::max<int64_t>(0, std::min(common_tokens, n - 1) - resume);
+            const char* cache_source = restore_source ? restore_source :
+                resume == 0 ? "miss" : from_live ? "live" : "checkpoint";
+            std::fprintf(stderr, "strata serve: cache coverage: common=%lld replay_gap=%lld fork_at=%lld policy=%s\n",
+                         (long long) common_tokens, (long long) checkpoint_gap, (long long) fork_at,
+                         o.prompt_cache_policy.c_str());
+            // Diagnostics without logging prompt text. Checkpoints share one positional KV branch:
+            // pinning the root against LRU does not make a different root safe to reuse.
+            int64_t root_common = 0;
+            const int64_t old_root = checks.empty() ? 0 : (int64_t) checks.front().ids.size();
+            if (!checks.empty())
+                while (root_common < std::min(old_root, n) &&
+                       checks.front().ids[(size_t) root_common] == (int32_t) ids[(size_t) root_common]) ++root_common;
+            std::fprintf(stderr, "strata serve: prefix cache: reused=%lld source=%s old_root=%lld common_root=%lld checkpoints=%zu\n",
+                         (long long) resume, restore_source ? restore_source : resume == 0 ? "miss" : from_live ? "live" : "checkpoint",
+                         (long long) old_root, (long long) root_common, checks.size());
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                             return (int64_t) c.ids.size() > resume || !checkpoint_matches(c);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
@@ -3858,17 +4543,14 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
-            mtp.set_prompt_len(n);
+            // A persisted system must include ALL of its MTP cells, even when the first request has a long tail.
+            mtp.set_prompt_len(o.prefix_cache_file.empty() && !conversation_cache ? n : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+            parked_conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
+            pp_done = read_from;
             pp_t0 = r0;
-            pp_next_check = reread_to > 0 ? INT64_MAX : resume + o.prompt_cache_every;
-            {
-                std::lock_guard<std::mutex> lk(part_mu);
-                part_at.clear();
-                std::fill(part_next.begin(), part_next.end(), pp_next_check);
-            }
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
@@ -3898,7 +4580,7 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 for (int64_t q = a; q < b;) {
-                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (stop_requested()) { e = "cancelled"; return false; }
                     const int T = (int) std::min<int64_t>(S, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
@@ -3913,6 +4595,7 @@ int main(int argc, char** argv) {
                     }
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
+                    pp_done = q;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
@@ -4013,14 +4696,18 @@ int main(int argc, char** argv) {
             // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
             // is cheaper to read again than the extra part costs (~0.3 s).
             int64_t root_at = -1;
-            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && read_from == 0)
-                for (int64_t i = 1; i < turn_at; ++i)
+            pp_root_end = 0;
+            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0)
+                for (int64_t i = 1; i < n - 1; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
-                        if (i >= o.prompt_cache_root) root_at = i;
+                        if (i >= o.prompt_cache_root) pp_root_end = i;
                         break;
                     }
+            if (pp_root_end > read_from) root_at = pp_root_end;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            const int64_t check_every = o.prompt_cache > 0 ? o.prompt_cache_every : 0;
+            for (const int64_t to : strata::program::conv_cache::read_boundaries(
+                     read_from, n - 1, root_at, turn_at, reread_to, check_every, fork_at)) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
@@ -4041,7 +4728,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
                 if (!sp_ok) {
-                    if (!stop_req.load()) {
+                    if (!stop_requested()) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
@@ -4057,14 +4744,20 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == fork_at || (check_every > 0 && to % check_every == 0)) && !checkpoint_at(to, to != turn_at && to != root_at && to != fork_at)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
+                if (to==pp_root_end && !stop_requested()) persist_system(to);
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
+            }
+            // Drain even on cancellation, before DONE or the next request can
+            // park/restore/reset state. Teardown also drains on every fatal exit.
+            if (!checkpoint_join()) {
+                std::printf("ERR finishing a conversation checkpoint failed\n"); return 1;
             }
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -4201,7 +4894,7 @@ int main(int argc, char** argv) {
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (stop_requested()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
@@ -4232,17 +4925,30 @@ int main(int argc, char** argv) {
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                cudaDeviceSynchronize();
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    std::printf("ERR synchronizing state fingerprint\n");
+                    return 1;
+                }
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
                     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
                     s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
                     return s;
                 }();
+                bool hash_ok = true;
+                std::array<uint8_t, 65536> hash_buffer;
                 auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
-                    std::vector<uint8_t> b(bytes);
-                    if (bytes) cudaMemcpy(b.data(), p, bytes, cudaMemcpyDefault);   // VRAM or a streamed host copy
-                    return fnv1a(b.data(), b.size(), h);
+                    for (size_t offset = 0; hash_ok && offset < bytes;) {
+                        const size_t n = std::min(hash_buffer.size(), bytes - offset);
+                        // VRAM or a streamed host copy, with fixed diagnostic workspace.
+                        if (cudaMemcpy(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n, cudaMemcpyDefault) != cudaSuccess) {
+                            hash_ok = false;
+                            break;
+                        }
+                        h = fnv1a(hash_buffer.data(), n, h);
+                        offset += n;
+                    }
+                    return h;
                 };
                 // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
                 auto hash_cells = [&](const void* pool, int64_t per_cell, int64_t c0, int64_t c1, uint64_t h) {
@@ -4257,7 +4963,7 @@ int main(int argc, char** argv) {
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
                 uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
+                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr && g.n_gdn_layers() > 0) {   // per GDN layer: which one differs first
                     const size_t per = z.gdn / (size_t) g.n_gdn_layers();
                     std::string s;
                     char b[8];
@@ -4267,8 +4973,10 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "strata serve: STATE_HASH_GDN %s\n", s.c_str());
                 }
-                uint64_t h_ple = hash_dev(ss.ple_hist, z.ple, 1469598103934665603ull);
+                uint64_t h_ple = hash_dev(ss.ple_hist, ss.ple_hist ? z.ple : 0, 1469598103934665603ull);
                 uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
+                uint64_t h_dead = h_tail;
+                uint64_t h_pool_complete = h_tail;  // upstream's extent, without the moving spare row
                 const int64_t kvb = qs.head_dim, scb = (qs.head_dim / 64) * 2;
                 // a state's K/V arrays and their bytes per (cell, head) row: the host copy when it has one
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
@@ -4281,18 +4989,23 @@ int main(int argc, char** argv) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q4 : st.v_q4, q4b},
                              {h ? st.host.k_scale : st.k_scale, scb}};
-                    } else {
+                    } else if (st.kv_int8) {
                         a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q : st.v_q, kvb},
                              {h ? st.host.k_scale : st.k_scale, scb}, {h ? st.host.v_scale : st.v_scale, scb}};
+                    } else {
+                        a = {{h ? st.host.k_pool : st.k_pool, qs.head_dim * 2},
+                             {h ? st.host.v_pool : st.v_pool, qs.head_dim * 2}};
                     }
                     return a;
                 };
                 const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
-                                                           ss.qsa_states[0].max_cells);
+                                                           ss.max_cells);
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
                     const strata::core::QsaState& st = ss.qsa_states[i];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
+                    h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
+                    h_pool_complete = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool_complete);
+                    h_pool = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4, h_pool);
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {
                         h_kv = hash_cells(pool, w, 0, L, h_kv);
@@ -4304,22 +5017,29 @@ int main(int argc, char** argv) {
                 const int64_t mL = std::min<int64_t>(L, ms.max_cells);
                 for (const auto& [pool, w] : kv_arrays(ms))
                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
+                if (!hash_ok) {
+                    std::printf("ERR reading state fingerprint\n");
+                    return 1;
+                }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
-                                     "kv=%016llx mtp=%016llx stale=%016llx ple_prev=%d,%d\n", (long long) L,
+                                     "kv=%016llx mtp=%016llx stale=%016llx dead=%016llx pooled_complete=%016llx ple_prev=%d,%d\n", (long long) L,
                              (unsigned long long) h_gdn, (unsigned long long) h_ple, (unsigned long long) h_tail,
                              (unsigned long long) h_pool, (unsigned long long) h_kv, (unsigned long long) h_mtp,
-                             (unsigned long long) h_stale, ss.ple_prev[0], ss.ple_prev[1]);
+                             (unsigned long long) h_stale, (unsigned long long) h_dead,
+                             (unsigned long long) h_pool_complete, ss.ple_prev[0], ss.ple_prev[1]);
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
-            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n, prompt_ms,
+            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups] [common] [replay gap] [source]
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %s\n", (long long) produced_n, (long long) n, prompt_ms,
                         decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume,
-                        (long long) req_hits, (long long) req_look);
+                        (long long) req_hits, (long long) req_look, (long long) common_tokens,
+                        (long long) checkpoint_gap, cache_source);
             std::fflush(stdout);
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
-            const int64_t fresh = n - resume;
-            std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+            // An aborted chunk has not completed all layers. Do not report the entire requested prompt as read.
+            const int64_t fresh = cancelled && produced_n == 0 ? std::max<int64_t>(0, pp_done - resume) : n - resume;
+            std::fprintf(stderr, "strata serve: prompt %lld tokens: %lld reused, %lld read in %.0f ms (%.1f tok/s), "
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
                          (long long) n, (long long) resume, (long long) fresh, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,

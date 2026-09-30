@@ -89,7 +89,8 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
-    /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
+    /// Checked before every chunk and layer: true stops early (`run` returns false with err "cancelled").
+    /// In-flight copies/kernels finish before returning; an incomplete chunk never calls on_chunk.
     std::function<bool()> should_stop;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token

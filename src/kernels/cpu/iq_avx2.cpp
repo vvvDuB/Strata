@@ -392,10 +392,18 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
 template <int NT>
 void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out,
                 int r0, int r1) {
+    if (r0 >= r1) return;
     const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
     const __m128i m4b = _mm_set1_epi8(0x0f);
     const __m256i ones = _mm256_set1_epi16(1);
     const int nb = n / QK4_NL;
+    constexpr int max_cached_blocks = 256;
+    alignas(64) float scales[NT][max_cached_blocks];
+    const bool cache_scales = nb <= max_cached_blocks;
+    if (cache_scales) {
+        for (int t = 0; t < NT; ++t)
+            for (int ib = 0; ib < nb; ++ib) scales[t][ib] = h2f(y[t][ib].d);
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         __m256 accf[NT];
@@ -414,7 +422,7 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
                 const block_q8_0& b = y[t][ib];
                 const __m256i q8 = _mm256_loadu_si256((const __m256i*) b.qs);
                 const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(q8, q4)), ones);
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * h2f(b.d)), _mm256_cvtepi32_ps(p), accf[t]);
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * (cache_scales ? scales[t][ib] : h2f(b.d))), _mm256_cvtepi32_ps(p), accf[t]);
             }
         }
         for (int t = 0; t < NT; ++t) out[t][r] = hsum8(accf[t]);
