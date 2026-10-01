@@ -35,6 +35,8 @@ The V7 preventive current-input checkpoint was not promoted. It reduced replay
 but did not demonstrate a repeatable end-to-end latency benefit and increased
 under-cap snapshot storage. No new input-marker retention hint is included here.
 This integration is not a fix for the intermittent CUDA/watchdog request stall.
+The subsequently diagnosed legacy disk-barrier stall and its separate fix are
+documented in [CACHE_WRITEBACK.md](CACHE_WRITEBACK.md); V6 alone did not fix it.
 
 ## Validation scope
 

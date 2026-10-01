@@ -97,8 +97,15 @@ bool prefix_write(const std::string& path,const PrefixFile& file,std::string& er
             uint64_t len=jobs[i].size;put(&len,8);put(&hashes[i],8);put(jobs[i].data,jobs[i].size);
         }
         put(footer,8);
-        if(fflush(out) || fsync(fileno(out)))throw std::runtime_error("cache sync failed");
-        fclose(out);out=nullptr;
+        // This is a reconstructible cache, not authoritative user data. A
+        // durable barrier can block for minutes under writeback pressure and
+        // abort an otherwise healthy request via the serve watchdog. Flush
+        // userspace buffers before atomic publication; let the OS write back
+        // the pages. After a power loss, a missing/truncated image is a miss
+        // (length, footer and checksum validation precede every GPU restore).
+        if(fflush(out))throw std::runtime_error("cache flush failed");
+        const int closed=fclose(out);out=nullptr;
+        if(closed)throw std::runtime_error("cache close failed");
         if(cancelled && cancelled())throw std::runtime_error("cancelled");
         // link publishes atomically and refuses to replace an existing cache, including a symlink.
         if(link(temp.c_str(),path.c_str()))throw std::runtime_error("cannot publish cache (already exists or I/O error)");

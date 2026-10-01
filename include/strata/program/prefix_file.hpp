@@ -17,6 +17,9 @@ struct PrefixFile {
 inline constexpr uint64_t kPrefixMaxBytes = 2ull << 30;
 bool prefix_is_system(const std::vector<int64_t>& tokens);
 uint64_t prefix_hash(const void* p, size_t n);
+// Complete, private, no-overwrite atomic publication. OS writeback, not
+// crash-durable storage: power loss can discard an image; readers validate it
+// before reuse. No fsync/fdatasync barrier on the inference request thread.
 bool prefix_write(const std::string& path, const PrefixFile& file, std::string& error,
                   uint64_t max_bytes = kPrefixMaxBytes, const std::function<bool()>& cancelled = {},
                   const BorrowedPrefixBlobs& borrowed = {});
