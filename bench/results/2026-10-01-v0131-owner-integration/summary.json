@@ -1,0 +1,127 @@
+{
+  "upstream_tag": "v0.1.31",
+  "upstream_commit": "9259cad4cfa3543cd3b8decab5962672b968c649",
+  "owner_parent": "dfacbce34ba5f7df93e740d1866e0752518c295b",
+  "streaming_default": 2048,
+  "profile_unchanged": true,
+  "prefill": 4096,
+  "checkpoint_interval": 4096,
+  "checkpoint_slots": 12,
+  "context_allocated": 131072,
+  "validation": {
+    "cache_cpu_suites": 14,
+    "cache_cpu_asan_ubsan_suites": 14,
+    "core_snapshot_suites": 9,
+    "serving_tests": 142,
+    "serving_skipped": 7,
+    "tool_tests": 131,
+    "tool_skipped": 3,
+    "synthetic_expert_layout_split_suites": 4,
+    "ple_gpu": "pass",
+    "iq3_constituent_kernel_parity_failures": 0,
+    "q3_completed_requests": 36,
+    "q3_correct_requests": 36,
+    "max_input_tokens": 45215,
+    "cancel_and_replacement_seconds": 1.925,
+    "systemd_services_created": 0,
+    "cancelled_prefill_system_target_tokens": 30000
+  },
+  "long_cases": [
+    {
+      "case": "A-latest-cold",
+      "prompt_tokens": 45170,
+      "cached_tokens": 0,
+      "correct": true
+    },
+    {
+      "case": "A-repeat-1",
+      "prompt_tokens": 45170,
+      "cached_tokens": 45163,
+      "correct": true
+    },
+    {
+      "case": "A-repeat-2",
+      "prompt_tokens": 45170,
+      "cached_tokens": 45169,
+      "correct": true
+    },
+    {
+      "case": "A-last-user-edit",
+      "prompt_tokens": 45170,
+      "cached_tokens": 36864,
+      "correct": true
+    },
+    {
+      "case": "A-edit-repeat-1",
+      "prompt_tokens": 45170,
+      "cached_tokens": 45163,
+      "correct": true
+    },
+    {
+      "case": "A-edit-repeat-2",
+      "prompt_tokens": 45170,
+      "cached_tokens": 45169,
+      "correct": true
+    },
+    {
+      "case": "A-append",
+      "prompt_tokens": 45200,
+      "cached_tokens": 45175,
+      "correct": true
+    },
+    {
+      "case": "B-cold",
+      "prompt_tokens": 28,
+      "cached_tokens": 0,
+      "correct": true
+    },
+    {
+      "case": "A-return-1",
+      "prompt_tokens": 45200,
+      "cached_tokens": 45193,
+      "correct": true
+    },
+    {
+      "case": "B-return",
+      "prompt_tokens": 28,
+      "cached_tokens": 0,
+      "correct": true
+    },
+    {
+      "case": "A-return-2",
+      "prompt_tokens": 45200,
+      "cached_tokens": 45193,
+      "correct": true
+    },
+    {
+      "case": "A-cycle-0",
+      "prompt_tokens": 45215,
+      "cached_tokens": 45169,
+      "correct": true
+    },
+    {
+      "case": "B-cycle-0",
+      "prompt_tokens": 28,
+      "cached_tokens": 0,
+      "correct": true
+    },
+    {
+      "case": "A-cycle-1",
+      "prompt_tokens": 45215,
+      "cached_tokens": 45191,
+      "correct": true
+    },
+    {
+      "case": "B-cycle-1",
+      "prompt_tokens": 28,
+      "cached_tokens": 0,
+      "correct": true
+    }
+  ],
+  "limitations": [
+    "single GPU only",
+    "no full 128k input test",
+    "no universal performance gain claim",
+    "three unrelated pre-existing global launcher failures"
+  ]
+}

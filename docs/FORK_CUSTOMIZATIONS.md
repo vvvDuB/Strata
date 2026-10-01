@@ -1,3 +1,7 @@
+# Current integration: 0.1.31
+
+The owner fork now integrates official `v0.1.31` (`9259cad4cfa3543cd3b8decab5962672b968c649`) on top of the V6/writeback baseline. See [UPSTREAM_0_1_31.md](UPSTREAM_0_1_31.md) for the current integration contract and validation. The older sections below are historical.
+
 # Fork customizations and upstream integration
 
 This fork retains the local inference/serving changes made on Strata 0.1.20

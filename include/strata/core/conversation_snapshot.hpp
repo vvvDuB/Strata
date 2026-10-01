@@ -36,6 +36,9 @@ struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
 };
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& sizes, std::string& error);
+// Session-owned rows; checked against the upstream layer-range carve.
+bool conversation_session_sizes(const ModelGeometry& g, const SessionState& session,
+                                ConversationStateSizes& sizes, std::string& error);
 bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, const SessionState& session,
                                       const ModelGeometry& g, std::string& error);
 // Validate targets and resize every running-state buffer, without issuing transfers.

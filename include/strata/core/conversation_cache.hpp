@@ -63,6 +63,7 @@ struct ConversationKvReuse {
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
+    int64_t layer_lo = 0, layer_hi = 0; // session carve; restore requires the same range
     ConversationCheckpoint live;
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer

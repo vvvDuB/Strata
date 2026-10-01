@@ -25,7 +25,7 @@ bool same(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
         a.stage_parts.empty() && b.stage_parts.empty();
 }
 bool same(const SavedConversation& a, const SavedConversation& b) {
-    if (a.geometry != b.geometry || a.cvec != b.cvec || !same(a.live, b.live) ||
+    if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec || !same(a.live, b.live) ||
         a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size()) return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same(a.checkpoints[i], b.checkpoints[i])) return false;
@@ -42,6 +42,7 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
 SavedConversation fixture() {
     SavedConversation s;
     for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(i) - 8;
+    s.layer_lo = 2; s.layer_hi = 4;
     s.cvec = false;
     s.live.ids = {1, -1, INT32_MIN, INT32_MAX};
     s.live.imgs = {{INT64_MIN, UINT64_MAX}, {3, 0x123456789abcdef0ULL}};
@@ -131,11 +132,12 @@ int main() {
     std::string sizing_error;
     check(conversation_file_size(source, measured, sizing_error) && measured == bytes.size(), "quota reservation equals encoded fixture length");
     const auto bound = integer(bytes, 40);
-    check(bytes.substr(0, 8) == std::string("STRSNAP\1", 8), "versioned magic");
+    check(bytes.substr(0, 8) == std::string("STRSNAP\2", 8), "versioned magic");
     check(integer(bytes, 48) == uint64_t(-8), "geometry signed bits are little endian");
-    check(integer(bytes, 192) == 0, "steering field");
-    check(integer(bytes, 200) == 4, "live token count");
-    check(uint8_t(bytes[212]) == 255 && uint8_t(bytes[215]) == 255, "negative tokens keep all bits");
+    check(integer(bytes, 192) == 2 && integer(bytes, 200) == 4, "session carve preserved");
+    check(integer(bytes, 208) == 0, "steering field");
+    check(integer(bytes, 216) == 4, "live token count");
+    check(uint8_t(bytes[228]) == 255 && uint8_t(bytes[231]) == 255, "negative tokens keep all bits");
     check(bound >= source.bytes(), "portable allocation bound covers decoded payload");
     std::string error;
     SavedConversation decoded;
@@ -168,11 +170,12 @@ int main() {
     for (size_t i = 0; i < bytes.size(); ++i) {
         auto damaged = bytes; damaged[i] ^= 1; rejected(damaged, id);
     }
+    auto old_schema = bytes; old_schema[7] = 1; rejected(old_schema, id);
     auto corrupt = bytes;
-    set_integer(corrupt, 200, UINT64_MAX); rejected(corrupt, id);
+    set_integer(corrupt, 216, UINT64_MAX); rejected(corrupt, id);
     corrupt = bytes; set_integer(corrupt, 40, UINT64_MAX); rejected(corrupt, id);
     corrupt = bytes; set_integer(corrupt, 40, kConversationFileWorkspace); rejected(corrupt, id);
-    corrupt = bytes; set_integer(corrupt, 192, 2); rejected(corrupt, id);
+    corrupt = bytes; set_integer(corrupt, 208, 2); rejected(corrupt, id);
 
     auto unsupported = source; unsupported.live.stage_parts.emplace_back();
     std::ostringstream output;
@@ -282,6 +285,6 @@ int main() {
     check(other == initial, "failed hash preserves caller identity");
     check(conversation_identity({}, "fixture-settings", other, error), "fixed identity fixture");
     // Independently computed with Python hashlib and struct.pack('<Q', length).
-    check(hex(other) == "aeeb88a7414a67200c4e756d5e9ab4a7f8510a7190193a0a418b66488efef8ce", "identity uses SHA-256 with framed fields");
+    check(hex(other) == "f2a2ddf97970d73dc7ab2a189888552fba723cead97fdd5e63020e60c53ff523", "identity uses SHA-256 with framed fields");
     std::printf("conversation_file_test: %d checks passed\n", checks);
 }

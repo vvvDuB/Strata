@@ -81,6 +81,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     std::array<QsaState, 2> layers{first.st, last.st};
     std::vector<uint8_t> gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
     SessionState ss;
+    ss.layer_hi = g.n_layers; ss.gdn_alloc = g.n_gdn_layers(); ss.qsa_alloc = g.n_qsa_layers();
     ss.max_cells = 96; ss.gdn_state = (float*) gdn.data();
     ss.ple_hist = ple ? (float*) history.data() : nullptr;
     ss.qsa_states = zero_qsa ? nullptr : layers.data();
@@ -88,6 +89,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     image.geometry = {g.n_embd,g.n_layers,g.qsa_interval,g.ssm_state_size,g.ssm_k_heads,g.ssm_v_heads,
                       g.ssm_d_conv,g.ssm_conv_channels,g.ssm_value_dim,g.n_head,g.n_head_kv,g.head_dim,
                       g.idx_q_heads,g.idx_key_dim,g.hc,g.hc_lr,g.n_expert,g.n_ff};
+    image.layer_hi = g.n_layers;
     auto checkpoint = [&](size_t tokens) {
         ConversationCheckpoint c;
         c.ids.resize(tokens);
@@ -138,6 +140,11 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         ss.qsa_states = nullptr;
         check(!conversation_snapshot_validate(image,ss,g,draft.st,error), "missing QSA targets rejected");
         ss.qsa_states = layers.data();
+        SessionState carve = ss;
+        carve.gdn_alloc = g.n_gdn_layers() / 2;
+        carve.qsa_alloc = 1; carve.qsa_ord0 = 1;
+        check(!conversation_checkpoint_validate(image.live, carve, g, error),
+              "whole-model checkpoint rejected by a partial session carve");
     }
     auto bad_geometry = g; bad_geometry.ssm_state_size = std::numeric_limits<int64_t>::max();
     check(!conversation_state_sizes(bad_geometry,z,error), "running-state arithmetic overflow rejected");

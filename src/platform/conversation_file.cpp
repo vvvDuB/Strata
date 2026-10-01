@@ -20,7 +20,7 @@ using core::ConversationImageKey;
 using core::ConversationKv;
 using core::ConversationBuffer;
 using core::SavedConversation;
-constexpr std::array<uint8_t, 8> magic{'S','T','R','S','N','A','P',1};
+constexpr std::array<uint8_t, 8> magic{'S','T','R','S','N','A','P',2};
 // GPU state blobs retain their native scalar representation.
 static_assert(std::endian::native == std::endian::little);
 // These portable allowances also bound vector-object storage before resize.
@@ -254,7 +254,7 @@ bool conversation_identity(const std::vector<ConversationAsset>& assets, const s
             const auto n = little(value.size()); hash.update(n.data(), n.size());
             hash.update(value.data(), value.size());
         };
-        text("strata-conversation-state-v1"); text(settings);
+        text("strata-conversation-state-v2"); text(settings);
         const auto count = little(assets.size()); hash.update(count.data(), count.size());
         std::array<char, 32768> buffer;
         std::map<std::filesystem::path, std::pair<uint64_t, ConversationIdentity>> contents;
@@ -293,6 +293,8 @@ bool conversation_file_write(std::ostream& stream, const SavedConversation& imag
         Writer w{stream, {}, {progress}};
         w.bytes(magic.data(), magic.size()); w.bytes(identity.data(), identity.size()); w.integer(bound);
         for (int64_t n : image.geometry) w.integer(std::bit_cast<uint64_t>(n));
+        w.integer(std::bit_cast<uint64_t>(image.layer_lo));
+        w.integer(std::bit_cast<uint64_t>(image.layer_hi));
         w.integer(image.cvec ? 1 : 0);
         w.checkpoint(image.live);
         w.integer(image.checkpoints.size());
@@ -315,7 +317,7 @@ bool conversation_file_write(std::ostream& stream, const SavedConversation& imag
 bool conversation_file_size(const SavedConversation& image, uint64_t& bytes, std::string& error) {
     try {
         // Header, geometry, steering, checkpoint/KV counts and integrity footer.
-        uint64_t total = 8 + 32 + 8 + 18 * 8 + 8 + 8 + 8 + 32;
+        uint64_t total = 8 + 32 + 8 + 18 * 8 + 16 + 8 + 8 + 8 + 32;
         auto checkpoint = [&](const ConversationCheckpoint& c) {
             if (!c.stage_parts.empty()) throw std::runtime_error("layer-split snapshots are unsupported");
             add(total, 8 * 8); // token/image counts, retention counter, five blob lengths
@@ -351,6 +353,9 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
         r.remaining = bound - kConversationFileWorkspace;
         SavedConversation image;
         for (auto& n : image.geometry) n = r.signed_integer();
+        image.layer_lo = r.signed_integer(); image.layer_hi = r.signed_integer();
+        if (image.layer_lo < 0 || image.layer_hi < image.layer_lo)
+            throw std::runtime_error("invalid snapshot layer range");
         const auto cvec = r.integer();
         if (cvec > 1) throw std::runtime_error("invalid snapshot steering state");
         image.cvec = cvec != 0;
@@ -396,7 +401,7 @@ bool conversation_file_match(std::istream& stream, const ConversationIdentity& i
         if (bound < kConversationFileWorkspace || bound > staging_limit)
             throw std::runtime_error("snapshot staging admission denied");
         p.allocation_remaining = bound - kConversationFileWorkspace;
-        p.skip(18 * 8); // geometry is validated by the shared core after selection
+        p.skip(18 * 8 + 16); // geometry and session carve is validated by the shared core after selection
         const auto steering = p.integer();
         if (steering > 1) throw std::runtime_error("invalid snapshot steering state");
         ConversationFileMatch found{0, false, bound};
