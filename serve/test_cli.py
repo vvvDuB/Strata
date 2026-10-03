@@ -41,6 +41,11 @@ class ServerCLI(unittest.TestCase):
         self.assertEqual(cfg["log"], "/logs/engine.log")
         self.assertEqual(cfg["args"][-4:], ["--host", "native-host", "--log", "native-log"])
 
+    def test_prefill_stream_threshold_is_forwarded_literally(self):
+        _, _, cfg = self.parse(self.direct() + ["--prefill-stream-min", "4096"])
+        self.assertEqual(cfg["args"][-2:], ["--prefill-stream-min", "4096"])
+        self.assertEqual(server.engine_args(cfg)[-2:], ["--prefill-stream-min", "4096"])
+
     def test_direct_layer_split_keeps_the_gpu_list(self):
         argv = self.direct()
         argv[argv.index("--gpu") + 1] = "0,2"
