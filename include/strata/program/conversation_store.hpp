@@ -5,7 +5,8 @@
 namespace strata::program {
 inline constexpr uint64_t kConversationMaxBytes = 4ull << 30;
 struct ConversationHit { std::string path; int64_t position = 0; };
-// Single writer, bounded disk backing for inactive text-only KV branches.
+// Single writer, bounded active-identity disk backing for inactive text-only KV branches.
+// Valid snapshots of other identities are retained for rollback, outside this identity's quota.
 class ConversationStore {
 public:
     ConversationStore() = default;

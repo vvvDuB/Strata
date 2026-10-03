@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
         f.blobs={PrefixBlob(256,(uint8_t)id),PrefixBlob(256,7)}; return f;
     };
     auto tokens = [](const PrefixFile& f) { std::vector<int64_t> v(f.tokens.begin(),f.tokens.end());v.push_back(99);return v; };
-    auto a=sample(30), b=sample(31), c=sample(32); std::string error;
+    auto a=sample(30), b=sample(31), c=sample(32); std::string error, rollback_path;
     {
         ConversationStore store;
         check(store.open(dir,"test-model",2,1600,error),"open private store");
@@ -73,11 +73,27 @@ int main(int argc, char** argv) {
         check(store.open(dir,"test-model",2,1600,error) && store.find(tokens(c)).position==5,"restart indexes compatible branch");
         auto longer=c;longer.tokens.push_back(60);longer.positions.push_back(6);
         check(store.put(longer,"",error) && store.size()==1,"newer same branch supersedes shorter snapshot");
+        rollback_path=store.find(tokens(longer)).path;
     }
     {
         ConversationStore store;
         check(store.open(dir,"different-model",2,1600,error) && store.size()==0,"identity change invalidates state");
+        check(store.bytes()==0 && store.find(tokens(c)).position==0,
+              "foreign snapshots are never counted or reused as active state");
+        check(fs::exists(rollback_path),"opening a new identity preserves compatible rollback files");
+        for (auto other : {a,b,c}) {
+            other.identity="different-model";
+            check(store.put(other,"",error),"new identity can save within its active quota");
+        }
+        check(store.size()==2 && store.bytes()<=1600 && fs::exists(rollback_path),
+              "active quota eviction cannot delete the previous identity");
         check(fs::exists(dir+"/keep-user-file.txt"),"cleanup never touches unrelated files");
+    }
+    {
+        ConversationStore store;
+        auto longer=c;longer.tokens.push_back(60);longer.positions.push_back(6);
+        check(store.open(dir,"test-model",2,1600,error) && store.contains(longer.tokens),
+              "returning to the previous identity can index the preserved snapshot");
     }
     fs::create_directory_symlink(dir,dir+"-link");
     ConversationStore symlink;

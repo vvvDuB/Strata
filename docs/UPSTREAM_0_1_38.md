@@ -36,6 +36,12 @@ benchmark environment and owner default 2048 remain supported. The value is
 reported at startup. It is distinct from the prefill chunk and checkpoint interval.
 Existing snapshot identity includes inference arguments and executable identity:
 a new build/setting can make the first conversation cold. Do not delete old caches.
+The legacy store now treats valid snapshots of another identity as safe misses,
+not corrupt files: it preserves them for rollback and never indexes/reuses/evicts
+them in the new identity. The 8192 MiB/four-entry limit applies to the active
+identity; preserved old identities can occupy additional disk space. Remove or
+archive them only with the owner's approval. Malformed files and abandoned atomic
+temporary files retain their existing cleanup behavior.
 
 ## Measurements and limitations
 

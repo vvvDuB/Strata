@@ -67,9 +67,12 @@ bool ConversationStore::open(const std::string& dir,const std::string& identity,
             }
             if (!owned_name(name)) continue;
             PrefixFile meta;std::string why;
-            if (!prefix_read(item.path().string(),meta,true,why,kConversationMaxBytes) || meta.identity!=identity_) {
+            if (!prefix_read(item.path().string(),meta,true,why,kConversationMaxBytes)) {
                 fs::remove(item.path());continue;
             }
+            // A different executable or inference setting is a safe miss, not corruption.
+            // Keep valid snapshots for rollback; never index, load or evict another identity.
+            if (meta.identity!=identity_) continue;
             entries_.push_back({item.path().string(),std::move(meta),item.file_size(),0});
         }
         std::sort(entries_.begin(),entries_.end(),[](const Entry& a,const Entry& b) {
