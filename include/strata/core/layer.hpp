@@ -217,6 +217,11 @@ struct QsaState {
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
     bool kv_hybrid = false;
+    /// RHT256 + NVFP4 K and V, 148 B per head/side. Resident main QSA only;
+    /// a distinct layout, never alias these pointers with Q4_0 or FP16 pools.
+    bool kv_nvfp4 = false;
+    uint8_t* k_nvfp4 = nullptr;
+    uint8_t* v_nvfp4 = nullptr;
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
     bool kv_rot = false;
@@ -291,12 +296,14 @@ bool qsa_kv_q4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
+void qsa_set_kv_nvfp4(bool enabled);
+bool qsa_kv_nvfp4();
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
 inline int qsa_kv_format(const QsaState& st) {
     // A hybrid K8V4 state is mode 0 only and never reaches the block movers; refuse rather than let it
     // fall through to kKvF16 - a wrong layout silently applied is worse than a hard stop (PR review).
-    if (st.kv_hybrid) {
-        std::fprintf(stderr, "strata: qsa_kv_format: a hybrid K8V4 state must never reach the block movers\n");
+    if (st.kv_hybrid || st.kv_nvfp4) {
+        std::fprintf(stderr, "strata: qsa_kv_format: a resident-only K8V4/NVFP4 state must never reach the block movers\n");
         std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
     }
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;

@@ -1,5 +1,6 @@
 #include "strata/program/prefix_state.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_nvfp4.hpp"
 #include <cstring>
 #include <stdexcept>
 namespace strata::program {
@@ -12,11 +13,22 @@ std::vector<View> views(const core::SessionState& ss,const core::ModelGeometry& 
     std::vector<View> v;
     for(int64_t i=0;i<=g.n_qsa_layers();++i) {
         const auto& st=i==g.n_qsa_layers()?mtp.kv_state():ss.qsa_states[i];
-        if(!st.kv_int8 || st.kv_q4 || st.kv_mode!=0 || !st.k_q || !st.v_q)
-            throw std::runtime_error("persistent prefix v1 requires resident INT8 KV and MTP");
-        for(const auto& item:std::vector<std::pair<void*,int64_t>>{{st.k_q,g.head_dim},{st.v_q,g.head_dim},
-                {st.k_scale,g.head_dim/64*2},{st.v_scale,g.head_dim/64*2}})
-            v.push_back({item.first,(size_t)(rows*item.second),item.second});
+        if (st.kv_nvfp4) {
+            if (st.kv_mode != 0 || st.kv_int8 || st.kv_q4 || st.kv_hybrid || st.kv_rot ||
+                g.head_dim != 256 || !st.k_nvfp4 || !st.v_nvfp4 || st.k_nvfp4 == st.v_nvfp4 ||
+                root > st.max_cells || rows > st.n_slots*s.page_size*g.n_head_kv || i == g.n_qsa_layers())
+                throw std::runtime_error("persistent prefix: invalid resident NVFP4 main state");
+            const int64_t bytes = sizeof(kernels::nvfp4::Row);
+            v.push_back({st.k_nvfp4, size_t(rows*bytes), bytes});
+            v.push_back({st.v_nvfp4, size_t(rows*bytes), bytes});
+        } else {
+            if(!st.kv_int8 || st.kv_q4 || st.kv_hybrid || st.kv_mode!=0 || !st.k_q || !st.v_q ||
+               !st.k_scale || !st.v_scale)
+                throw std::runtime_error("persistent prefix requires resident INT8/NVFP4 KV and INT8 MTP");
+            for(const auto& item:std::vector<std::pair<void*,int64_t>>{{st.k_q,g.head_dim},{st.v_q,g.head_dim},
+                    {st.k_scale,g.head_dim/64*2},{st.v_scale,g.head_dim/64*2}})
+                v.push_back({item.first,(size_t)(rows*item.second),item.second});
+        }
         if(i<g.n_qsa_layers())v.push_back({st.idx_pooled,(size_t)(root/s.idx_block*g.idx_key_dim*4),0});
     }
     return v;

@@ -144,6 +144,21 @@ int main() {
     std::istringstream input(bytes, std::ios::binary);
     check(conversation_file_read(input, id, bound, bound + 17, 17, decoded, error), "exact staging and floor admitted");
     check(same(source, decoded), "all formats, checkpoints and buffers survive round trip");
+    // New format gets a distinct tag; it must not broaden acceptance to the
+    // previous experimental TQ4-V tag 4, or to arbitrary future format numbers.
+    {
+        auto nv = source;
+        auto& k = nv.kv[0];
+        k.format = 5; k.head_dim = 256; k.heads = 2; k.page_size = 4; k.cells = 4;
+        k.k.resize(4*2*148, 0x31); k.v.resize(4*2*148, 0x97);
+        k.k_scale = {}; k.v_scale = {};
+        const auto nv_bytes = encode(nv, id);
+        const auto nv_bound = integer(nv_bytes, 40);
+        std::istringstream read_nv(nv_bytes, std::ios::binary);
+        check(conversation_file_read(read_nv, id, nv_bound, nv_bound+17, 17, decoded, error), "NVFP4 format 5 is readable");
+        check(same(nv, decoded), "NVFP4 K/V rows and absent side scales roundtrip exactly");
+        for(int unsupported : {4,6,17,255}) {nv.kv[0].format=unsupported; rejected(encode(nv,id),id);}
+    }
     {
         auto segmented = source, canonical = source;
         segmented.kv[0].k = {};

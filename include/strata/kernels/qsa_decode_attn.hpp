@@ -30,7 +30,21 @@ struct QsaAttnPools {
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
     const int32_t* page_table = nullptr;
+    const uint8_t* k_nvfp4 = nullptr;   ///< nvfp4::Row, separate from Q4_0
+    const uint8_t* v_nvfp4 = nullptr;
+    int64_t nvfp4_max_cells = 0;        ///< explicit bounds for sparse NVFP4 loads
+    int64_t nvfp4_pages = 0;
 };
+
+// Mixed pools are rejected: layout confusion otherwise looks like plausible
+// attention, rather than an obvious memory fault.
+inline bool qsa_nvfp4_pools_valid(const QsaAttnPools& p, const QsaShapes& s) {
+    return p.k_nvfp4 && p.v_nvfp4 && p.k_nvfp4 != p.v_nvfp4 && p.page_table &&
+           !p.k_pool && !p.v_pool && !p.k_q && !p.v_q && !p.k_scale && !p.v_scale && !p.k_q4 && !p.v_q4 &&
+           s.head_dim == 256 && s.n_head_kv > 0 && s.n_head_kv <= 65535 &&
+           s.n_head == 12*s.n_head_kv && s.page_size > 0 && s.page_size <= INT32_MAX && p.nvfp4_max_cells > 0 && p.nvfp4_max_cells <= INT32_MAX &&
+           p.nvfp4_pages >= (p.nvfp4_max_cells + s.page_size - 1) / s.page_size;
+}
 
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);

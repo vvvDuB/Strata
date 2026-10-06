@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nvfp4.hpp"
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 
@@ -26,6 +27,10 @@ bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
 
 bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
     if (!valid_extent(st, upto, error)) return false;
+    if (st.kv_nvfp4 && (st.kv_mode != 0 || st.kv_q4 || st.kv_int8 || st.kv_hybrid || st.kv_rot || g.head_dim != 256 || st.k_nvfp4 == st.v_nvfp4)) {
+        error = "conversation snapshot: NVFP4 requires resident RHT256 and distinct format flags";
+        return false;
+    }
     if (st.kv_hybrid && (st.kv_mode != 0 || st.kv_q4 || st.kv_int8)) {
         error = "conversation snapshot: hybrid K8V4 requires an identity layout and distinct format flags";
         return false;
@@ -38,7 +43,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         return false;
     }
     const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+    const size_t per = st.kv_nvfp4 ? sizeof(strata::kernels::nvfp4::Row) : st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
                               : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
     // restore reconstructs that row when rewinding to an earlier prefix.
@@ -48,7 +53,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    l = {(st.kv_nvfp4 ? strata::kernels::nvfp4::snapshot_format : st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
@@ -72,6 +77,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
 
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     const bool host = st.kv_mode != 0 && !resident;
+    if (st.kv_nvfp4) return {st.k_nvfp4, st.v_nvfp4, nullptr, nullptr, st.idx_pooled};
     if (st.kv_hybrid) return {st.k_q, st.v_q4, st.k_scale, nullptr, st.idx_pooled};
     if (st.kv_q4)
         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
@@ -148,6 +154,11 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     if (!valid(st, l, upto, error)) return false;
     if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
         error = "conversation snapshot: invalid unchanged prefix";
+        return false;
+    }
+    if (unchanged_tokens > 0 && (image.format != l.format || image.heads != g.n_head_kv ||
+        image.head_dim != g.head_dim || image.page_size != l.page_size || image.idx_dim != g.idx_key_dim)) {
+        error = "conversation snapshot: reusable prefix has incompatible KV format/geometry";
         return false;
     }
     const int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;

@@ -277,6 +277,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_nvfp4.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -317,6 +318,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
+  # KV encoding is a serialized numerical contract. In particular, exact
+  # divisions must not silently become approximate reciprocals via fast-math.
+  if(STRATA_ENABLE_CUDA)
+    set_source_files_properties(src/kernels/cuda/kv_nvfp4.cu
+      PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true")
+  endif()
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
@@ -1174,4 +1181,30 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
   endif()
+endif()
+
+option(STRATA_TEST_NVFP4 "Build RHT+NVFP4 real-CUDA parity gates (no model required)" OFF)
+if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/tests/nvfp4_tests.cmake")
+endif()
+if(STRATA_TEST_NVFP4)
+  if(NOT STRATA_ENABLE_CUDA)
+    message(FATAL_ERROR "STRATA_TEST_NVFP4 requires STRATA_ENABLE_CUDA=ON and a CUDA toolkit")
+  endif()
+  enable_testing()
+  add_executable(kv_nvfp4_gpu_test tests/kv_nvfp4_gpu_test.cpp)
+  target_include_directories(kv_nvfp4_gpu_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(kv_nvfp4_gpu_test PRIVATE strata_kernels CUDA::cudart)
+  add_executable(kv_nvfp4_native_conversion tests/kv_nvfp4_native_conversion.cu)
+  target_include_directories(kv_nvfp4_native_conversion PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_compile_features(kv_nvfp4_native_conversion PRIVATE cuda_std_17)
+  target_link_libraries(kv_nvfp4_native_conversion PRIVATE CUDA::cudart)
+  add_executable(kv_nvfp4_unpack_test tests/kv_nvfp4_unpack_test.cu)
+  target_include_directories(kv_nvfp4_unpack_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_compile_features(kv_nvfp4_unpack_test PRIVATE cuda_std_17)
+  target_link_libraries(kv_nvfp4_unpack_test PRIVATE CUDA::cudart)
+  foreach(t kv_nvfp4_gpu_test kv_nvfp4_native_conversion kv_nvfp4_unpack_test)
+    add_test(NAME ${t} COMMAND ${t})
+    set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  endforeach()
 endif()

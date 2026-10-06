@@ -365,7 +365,7 @@ bool conversation_file_read(std::istream& stream, const ConversationIdentity& id
         r.allocate(image.kv, r.integer(), kv_overhead);
         for (auto& kv : image.kv) {
             const auto format = r.integer();
-            if (format > 3) throw std::runtime_error("unsupported snapshot KV format");
+            if (format > 3 && format != 5) throw std::runtime_error("unsupported snapshot KV format");
             kv.format = static_cast<int>(format);
             kv.cells = r.signed_integer(); kv.heads = r.signed_integer(); kv.head_dim = r.signed_integer();
             kv.page_size = r.signed_integer(); kv.pooled_rows = r.signed_integer(); kv.idx_dim = r.signed_integer();

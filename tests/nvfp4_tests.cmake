@@ -1,0 +1,10 @@
+set(NV4_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+add_executable(kv_nvfp4_cpu_test "${NV4_ROOT}/tests/kv_nvfp4_cpu_test.cpp")
+target_include_directories(kv_nvfp4_cpu_test PRIVATE "${NV4_ROOT}/include")
+target_compile_features(kv_nvfp4_cpu_test PRIVATE cxx_std_20)
+add_test(NAME kv_nvfp4_cpu_test COMMAND kv_nvfp4_cpu_test)
+add_executable(kv_nvfp4_snapshot_host_test "${NV4_ROOT}/tests/kv_nvfp4_snapshot_host_test.cpp"
+    "${NV4_ROOT}/src/core/conversation_snapshot.cpp" "${NV4_ROOT}/src/program/prefix_state.cpp")
+target_include_directories(kv_nvfp4_snapshot_host_test PRIVATE "${NV4_ROOT}/tests/host_cuda_stub" "${NV4_ROOT}/include")
+target_compile_features(kv_nvfp4_snapshot_host_test PRIVATE cxx_std_20)
+add_test(NAME kv_nvfp4_snapshot_host_test COMMAND kv_nvfp4_snapshot_host_test)

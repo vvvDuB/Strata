@@ -50,6 +50,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nvfp4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -477,6 +478,7 @@ void usage() {
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "  --kv nvfp4           experimental RHT256 + NVFP4 K/V, 592 B/cell; resident only\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); not with --kv-resident\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
@@ -1653,10 +1655,11 @@ int main(int argc, char** argv) {
     }
 #endif
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "nvfp4") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or nvfp4\n");
         return 2;
     }
+    strata::core::qsa_set_kv_nvfp4(o.kv == "nvfp4");
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
@@ -1668,6 +1671,10 @@ int main(int argc, char** argv) {
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
+        return 2;
+    }
+    if (o.kv == "nvfp4" && o.kv_resident > 0) {
+        std::fprintf(stderr, "strata generate: --kv nvfp4 requires --kv-resident 0\n");
         return 2;
     }
     if (o.kv == "k8v4" && o.kv_resident > 0) {
@@ -4726,6 +4733,7 @@ int main(int argc, char** argv) {
                 auto kv_identity = [&](const strata::core::QsaState& kv) {
                     settings << kv.max_cells << ' ' << kv.n_slots << ' ' << kv.kv_mode << ' '
                              << kv.kv_int8 << ' ' << kv.kv_q4 << ' ' << kv.kv_hybrid << '\n';
+                    if (kv.kv_nvfp4) settings << "nvfp4-rht256-v1-seed-a341316c-row148\n";
                 };
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) kv_identity(ss.qsa_states[i]);
                 kv_identity(mtp.kv_state());
@@ -4873,9 +4881,9 @@ int main(int argc, char** argv) {
         strata::program::ConversationStore conversations;
         const bool conversation_cache = !o.conversation_cache_dir.empty();
         if (!o.prefix_cache_file.empty() || conversation_cache) {
-            if (multi_gpu || o.kv != "int8" || o.kv_resident != 0 || o.prompt_cache < 1 || o.prompt_cache_root < 1 ||
+            if (multi_gpu || (o.kv != "int8" && o.kv != "nvfp4") || o.kv_resident != 0 || o.prompt_cache < 1 || o.prompt_cache_root < 1 ||
                 o.mtp.empty() || !o.cvec_files.empty() || o.vision) {
-                std::fprintf(stderr, "strata disk cache: requires single-GPU resident INT8 KV, MTP, prompt cache/root; no vision/control vectors\n");
+                std::fprintf(stderr, "strata disk cache: requires single-GPU resident INT8/NVFP4 KV, MTP, prompt cache/root; no vision/control vectors\n");
                 return 1;
             }
             try {
@@ -4897,6 +4905,7 @@ int main(int argc, char** argv) {
                 for (const auto& f:files) if (!f.empty() && std::filesystem::is_regular_file(f))
                     key << '|' << std::filesystem::absolute(f).string() << ':' << std::filesystem::file_size(f)
                         << ':' << std::filesystem::last_write_time(f).time_since_epoch().count();
+                if (o.kv == "nvfp4") key << "|kv=nvfp4-rht256-v1-seed-a341316c-row148";
                 disk_identity=key.str();
                 const std::filesystem::path base=std::filesystem::absolute(o.prefix_cache_file.empty()?".":o.prefix_cache_file);
                 if (!o.prefix_cache_file.empty() && std::filesystem::exists(base.parent_path())) {
@@ -6544,7 +6553,10 @@ int main(int argc, char** argv) {
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
+                    if (st.kv_nvfp4) {
+                        const int64_t b = (int64_t) strata::kernels::kv_nvfp4_bytes_per_head();
+                        a = {{st.k_nvfp4, b}, {st.v_nvfp4, b}};
+                    } else if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {
