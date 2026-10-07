@@ -693,6 +693,13 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if (n > 0 && (layers == nullptr || experts == nullptr || dst == nullptr)) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (!copy_blob(layers[i], experts[i], dst[i])) return false;
+    return true;
+}
+
 // ================================ CS-T: THE GGUF SHARDS IN PLACE ================================
 //
 // A native pack without experts.bin: every file native_experts.txt names is mapped (MapViewOfFile / mmap, no
@@ -1564,6 +1571,38 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     if (!copy_from_files(layer, expert, dst)) return false;
+    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+// The prompt stager submits consecutive jobs together. Linux's O_DIRECT/AIO path merges touching aligned ranges
+// up to 32 MiB and queues the remaining ranges before waiting. Resident blobs are copied without disk I/O;
+// resident_blob follows exchange rotation, unlike the original complement offsets.
+bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if (n > 0 && (layers == nullptr || experts == nullptr || dst == nullptr)) return false;
+    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+    thread_local std::vector<Fill> fills;
+    fills.clear();
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t l = layers[i], e = experts[i];
+        if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
+        const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
+        if (complement_ready_ &&
+            (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
+            if (!copy_blob(l, e, dst[i])) return false;
+            continue;
+        }
+        fills.push_back({0, l, e, dst[i]});
+        bytes += layer_blob_bytes_[(size_t) l];
+    }
+    if (fills.empty()) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!read_direct(fills.data(), fills.size()))
+        for (const Fill& f : fills)   // a failed batch: each blob on its own (copy_from_files falls back to the mapping)
+            if (!copy_from_files(f.layer, f.e, f.dst)) return false;
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);

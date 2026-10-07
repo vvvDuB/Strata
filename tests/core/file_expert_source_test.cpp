@@ -403,7 +403,7 @@ void test_unbuffered_reads() {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
-    constexpr int64_t experts = 3;
+    constexpr int64_t experts = 35;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
     const uint64_t total = (uint64_t) layers * layer_bytes;
     TempDirectory dir(fs::current_path());
@@ -422,6 +422,34 @@ void test_unbuffered_reads() {
     }
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    auto check_batches = [&]() {
+        // Out-of-order layers, duplicate experts and adjacent ranges; guard both ends of every destination.
+        for (const size_t n : {1u, 8u, 32u}) {
+            std::vector<int32_t> ls(n), es(n);
+            std::vector<std::vector<uint8_t>> outputs(n, std::vector<uint8_t>((size_t) BLOB + 2, 0xA5));
+            std::vector<uint8_t*> dst(n);
+            for (size_t i = 0; i < n; ++i) {
+                ls[i] = (int32_t) (n == 32 ? 0 : (i / 3) % layers);
+                es[i] = (int32_t) (n == 32 ? i : (i * 2) % 3);
+                dst[i] = outputs[i].data() + 1;
+            }
+            require(source.copy_blobs(ls.data(), es.data(), dst.data(), n), "batch copy failed");
+            for (size_t i = 0; i < n; ++i) {
+                require(outputs[i].front() == 0xA5 && outputs[i].back() == 0xA5, "batch wrote past its destination");
+                require(std::memcmp(dst[i], bytes.data() + ls[i] * layer_bytes + es[i] * BLOB, BLOB) == 0,
+                        "batch returned bytes from the wrong expert");
+            }
+            const int32_t invalid = (int32_t) layers;
+            require(!source.copy_blobs(&invalid, es.data(), dst.data(), 1), "batch accepted an invalid layer");
+            require(!source.copy_blobs(nullptr, es.data(), dst.data(), n), "batch accepted null layers");
+            require(!source.copy_blobs(ls.data(), nullptr, dst.data(), n), "batch accepted null experts");
+            require(!source.copy_blobs(ls.data(), es.data(), nullptr, n), "batch accepted null destinations");
+            dst[0] = nullptr;
+            require(!source.copy_blobs(ls.data(), es.data(), dst.data(), n), "batch accepted a null destination");
+        }
+        require(source.copy_blobs(nullptr, nullptr, nullptr, 0), "an empty batch failed");
+    };
+    check_batches();   // mapped fallback, before opening O_DIRECT handles
     set_env("STRATA_UNBUFFERED_LOAD", "1");
     std::string why;
     const bool unbuffered = source.set_unbuffered(0, why);
@@ -438,8 +466,9 @@ void test_unbuffered_reads() {
     return;
 #endif
     require(source.unbuffered(), "set_unbuffered succeeded but the source is not unbuffered");
-    const int64_t batch[experts] = {0, 1, 2};
-    source.prefetch(1, batch, experts);   // layer 1 in one batch: three adjacent blobs
+    check_batches();   // Linux AIO, including more than the 32 MiB merge limit
+    const int64_t batch[3] = {0, 1, 2};
+    source.prefetch(1, batch, 3);   // layer 1 in one batch: three adjacent blobs
     for (int64_t l = 0; l < layers; ++l)
         for (int64_t e = 0; e < experts; ++e) {
             const uint8_t* b = source.blob(l, e);
@@ -522,7 +551,7 @@ void test_rotating_source(bool rotate, bool pin) {
 #else
     setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
 #endif
-    TempDirectory dir;
+    TempDirectory dir(fs::current_path());
     std::string err;
     require(expert_layout_load(dir.path.string(), 1, 5, err), err);
     const size_t bytes = (size_t)BLOB;
@@ -549,6 +578,13 @@ void test_rotating_source(bool rotate, bool pin) {
     require(src.reserve_exchanges(2, err), err);
     require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
     require(src.reserve_exchanges(1, err), "smaller capacity rejected");
+#if defined(__linux__)
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = src.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    require(direct, "rotation batch fixture needs O_DIRECT: " + why);
+#endif
     if (rotate && pin) require(!src.reserve_exchanges(3, err), "live arena growth accepted");
     int incoming[2] = {0, 1}, outgoing[2] = {2, 3};
     std::vector<uint8_t> actual(bytes);
@@ -578,6 +614,11 @@ void test_rotating_source(bool rotate, bool pin) {
             require(held == ((rotate && pin) ? eviction[q] : prior[q]), "wrong storage selected");
             if (rotate && pin) require(src.exchange_buffer(q) == prior[q], "old input not recycled");
             require(src.copy_blob(0, outgoing[q], actual.data()) && actual == truth[outgoing[q]], "copy_blob mismatch");
+            const int32_t ls[2] = {0, 0}, es[2] = {outgoing[q], 4};
+            std::vector<uint8_t> file(bytes);
+            uint8_t* dst[2] = {actual.data(), file.data()};
+            require(src.copy_blobs(ls, es, dst, 2) && actual == truth[outgoing[q]] && file == truth[4],
+                    "batched resident/file copy lost an exchange rotation");
             require(!src.transient(0, outgoing[q]), "resident became transient");
             if (pin) {
                 require(src.pinned(0, outgoing[q]) && src.device_alias(0, outgoing[q]), "mapping lost");

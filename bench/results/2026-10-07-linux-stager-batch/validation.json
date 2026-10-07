@@ -1,0 +1,510 @@
+{
+  "upstream_pr": "https://github.com/Niko1221/Strata/pull/1323",
+  "upstream_commit": "b89e2aef42bbc46a5a9d30d82659719427df2518",
+  "hardware": {
+    "gpu": "RTX 5070 12 GiB SM120",
+    "cpu": "Ryzen 5700X3D",
+    "ram_gib": 32,
+    "cuda": "13.4"
+  },
+  "profile": {
+    "kv": "nvfp4",
+    "kv_grow": true,
+    "vram_elastic": true,
+    "context": 131072,
+    "resident_budget_gib": 22,
+    "vram_reserve_mib": 640,
+    "prefill": 8192,
+    "prompt_cache_reuse": false
+  },
+  "baseline_sha256": "b3ddfbafa535f4897e524236a48d03210fe7cb49f11881bfc0eb6be3cf6e5345",
+  "candidate_sha256": "913845d2dd2ac5033ae4a4c0f6d75b3160a2f14a43bf3777c6a49fcc860956bc",
+  "summary": {
+    "8192": {
+      "baseline_tok_s": [
+        1176.3692236997042,
+        1085.392514077509
+      ],
+      "candidate_tok_s": [
+        1198.5895503826064,
+        1168.71629526065
+      ],
+      "gain_percent": 4.66645562630168
+    },
+    "32768": {
+      "baseline_tok_s": [
+        208.28764646019698,
+        1337.3820485192805
+      ],
+      "candidate_tok_s": [
+        1413.6324417601381,
+        369.4141998092502
+      ],
+      "gain_percent": 15.357546787708909
+    }
+  },
+  "runs": [
+    {
+      "run": 0,
+      "arm": "baseline",
+      "batch": 1,
+      "sha256": "b3ddfbafa535f4897e524236a48d03210fe7cb49f11881bfc0eb6be3cf6e5345",
+      "startup_s": 26.891922752001847,
+      "short_text": "4",
+      "final_info_from_log": {
+        "expert_slots": 3354,
+        "kv_cells": 8192
+      },
+      "memory_samples_unavailable": "initial harness rejected the end-of-turn token and then a zombie /proc sample; native requests and shutdown completed",
+      "initial_slots": 3354,
+      "final_slots": 3354
+    },
+    {
+      "run": 1,
+      "arm": "candidate",
+      "batch": 8,
+      "sha256": "913845d2dd2ac5033ae4a4c0f6d75b3160a2f14a43bf3777c6a49fcc860956bc",
+      "startup_s": 95.85442760199658,
+      "short_text": "4",
+      "max_rss_bytes": 28705673216,
+      "max_swap_bytes": 0,
+      "initial_slots": 3354,
+      "final_slots": 3354
+    },
+    {
+      "run": 2,
+      "arm": "candidate",
+      "batch": 8,
+      "sha256": "913845d2dd2ac5033ae4a4c0f6d75b3160a2f14a43bf3777c6a49fcc860956bc",
+      "startup_s": 27.456121901996084,
+      "short_text": "4",
+      "max_rss_bytes": 28697866240,
+      "max_swap_bytes": 0,
+      "initial_slots": 3354,
+      "final_slots": 3354
+    },
+    {
+      "run": 3,
+      "arm": "baseline",
+      "batch": 1,
+      "sha256": "b3ddfbafa535f4897e524236a48d03210fe7cb49f11881bfc0eb6be3cf6e5345",
+      "startup_s": 90.10527788499894,
+      "short_text": "4",
+      "max_rss_bytes": 27976904704,
+      "max_swap_bytes": 0,
+      "initial_slots": 3354,
+      "final_slots": 3354
+    },
+    {
+      "run": 4,
+      "arm": "candidate-control",
+      "batch": 1,
+      "sha256": "913845d2dd2ac5033ae4a4c0f6d75b3160a2f14a43bf3777c6a49fcc860956bc",
+      "startup_s": 26.80568896600016,
+      "short_text": "4",
+      "max_rss_bytes": 27968516096,
+      "max_swap_bytes": 0,
+      "initial_slots": 3354,
+      "final_slots": 3354
+    },
+    {
+      "run": 5,
+      "arm": "candidate",
+      "batch": 8,
+      "sha256": "913845d2dd2ac5033ae4a4c0f6d75b3160a2f14a43bf3777c6a49fcc860956bc",
+      "startup_s": 27.249477470002603,
+      "short_text": "4",
+      "max_rss_bytes": 28696064000,
+      "max_swap_bytes": 0,
+      "initial_slots": 3354,
+      "final_slots": 3354
+    }
+  ],
+  "records": [
+    {
+      "run": 0,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "warmup",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1074.9950790630537,
+      "wall_s": 7.874053952997201,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7620.5
+    },
+    {
+      "run": 0,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1176.3692236997042,
+      "wall_s": 7.1752241299982416,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 6963.8
+    },
+    {
+      "run": 0,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 208.28764646019698,
+      "wall_s": 157.52300155600096,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 157320.9
+    },
+    {
+      "run": 1,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "warmup",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1122.7146890332483,
+      "wall_s": 7.521655279997503,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7296.6
+    },
+    {
+      "run": 1,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "measure",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1198.5895503826064,
+      "wall_s": 7.04508801799966,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 6834.7
+    },
+    {
+      "run": 1,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "measure",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 1413.6324417601381,
+      "wall_s": 23.395623942000384,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 23180.0
+    },
+    {
+      "run": 2,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "warmup",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1060.2883694442287,
+      "wall_s": 7.965718980995007,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7726.2
+    },
+    {
+      "run": 2,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "confounded",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1123.1764834923767,
+      "wall_s": 7.5204844280015095,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "excluded_reason": "replace complete paired measurement session: sanitizer overlapped its 32K request",
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7293.6
+    },
+    {
+      "run": 2,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "confounded",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 1384.6784451102276,
+      "wall_s": 23.865003530998365,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "excluded_reason": "replace complete paired measurement session: sanitizer overlapped its 32K request",
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 23664.7
+    },
+    {
+      "run": 3,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "warmup",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1072.0268006700167,
+      "wall_s": 7.866278992994921,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7641.6
+    },
+    {
+      "run": 3,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1085.392514077509,
+      "wall_s": 7.770345407006971,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7547.5
+    },
+    {
+      "run": 3,
+      "arm": "baseline",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 1337.3820485192805,
+      "wall_s": 24.700967554999806,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 24501.6
+    },
+    {
+      "run": 4,
+      "arm": "candidate-control",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1096.9322853202286,
+      "wall_s": 7.710345079001854,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7468.1
+    },
+    {
+      "run": 4,
+      "arm": "candidate-control",
+      "batch": 1,
+      "phase": "measure",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 1343.9036694049469,
+      "wall_s": 24.627504739997676,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 24382.7
+    },
+    {
+      "run": 5,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "warmup",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1034.6569667576032,
+      "wall_s": 8.183844703999057,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7917.6
+    },
+    {
+      "run": 5,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "measure",
+      "prompt_tokens": 8192,
+      "prefill_tok_s": 1168.71629526065,
+      "wall_s": 7.217156887993042,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3354,
+      "kv_cells": 16384,
+      "reused": 0,
+      "prompt_ms": 7009.4
+    },
+    {
+      "run": 5,
+      "arm": "candidate",
+      "batch": 8,
+      "phase": "measure",
+      "prompt_tokens": 32768,
+      "prefill_tok_s": 369.4141998092502,
+      "wall_s": 88.90018617400347,
+      "text": "731<|im_end|>",
+      "token_ids": [
+        22,
+        18,
+        16,
+        248046
+      ],
+      "expert_slots": 3256,
+      "kv_cells": 40960,
+      "reused": 0,
+      "prompt_ms": 88702.6
+    }
+  ],
+  "validation": {
+    "ctest_passed": 3,
+    "server_tests_passed": 11,
+    "rotation_variants_passed": 3,
+    "sanitizer_errors": 0,
+    "all_measured_token_streams_equal": true,
+    "ring_and_cancel": {
+      "ring_clamp": true,
+      "cancel_seconds": 3.798280889997841,
+      "post_cancel_text": "4",
+      "final_info": {
+        "version": "0.1.40",
+        "context": 131072,
+        "kv": "nvfp4",
+        "kv_resident": 0,
+        "expert_slots": 3354,
+        "expert_cache_mib": 5607,
+        "expert_slots_primary": 3354,
+        "expert_cache_primary_mib": 5607,
+        "spec": 6,
+        "mtp_max": 4,
+        "lookup": 3,
+        "vram_free_mib": 225,
+        "cvec": "project:4-44",
+        "arena_mib": 22527,
+        "pool_workers": 7,
+        "pcie_frac": "0.55",
+        "spec_min_p": "0.50",
+        "conversation_ram_cache_mib": 0,
+        "conversation_ram_cache_slots": 0,
+        "conversation_ram_cache_min_free_mib": 4096,
+        "conversation_disk_mib": 0,
+        "conversation_disk_slots": 0,
+        "tail_role_token": -1,
+        "vram_elastic": 1,
+        "kv_grow": 1,
+        "kv_cells": 8192,
+        "kv_mapped_mib": 108,
+        "engine": "0.1.40"
+      },
+      "passed": true
+    }
+  }
+}
