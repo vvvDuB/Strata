@@ -2,6 +2,11 @@
 
 The owner fork integrates official `v0.1.40.1` (`82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`), retaining the owner cache, cancellation, direct server CLI, AVX2 and NVFP4 changes. See [UPSTREAM_0_1_40_1.md](UPSTREAM_0_1_40_1.md) for the current integration and validation. The older sections below are historical.
 
+The fork also supports [vision on demand](VISION_ON_DEMAND.md): an ephemeral
+encoder, disk-cached SVE1 embeddings and temporary GPU expert-cache leases,
+including the resident low-RAM complement. Existing resident vision remains
+the default; no additional permanent encoder VRAM reserve is required.
+
 # Fork customizations and upstream integration
 
 This fork retains the local inference/serving changes made on Strata 0.1.20

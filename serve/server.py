@@ -874,9 +874,17 @@ class StrataEngine:
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
         started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
+        return self._vram_command("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), timeout)
+
+    def vision_vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
+        """Open a temporary cache lease, or restore the exact preceding size after the vision child exited."""
+        cmd = "VRAM END" if reserve_mib is None else f"VRAM BEGIN {int(reserve_mib)}"
+        return self._vram_command(cmd, timeout)
+
+    def _vram_command(self, cmd: str, timeout: float) -> dict:
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+        self.proc.stdin.write(cmd + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
         while True:
@@ -1664,7 +1672,7 @@ def network_path(path: str) -> bool:
 
 
 class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
+    """The image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
 
@@ -1689,20 +1697,46 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
+        mode = cfg.get("mode", "resident")
+        if mode not in ("resident", "on-demand"):
+            raise ValueError("vision.mode must be resident or on-demand")
+        self.on_demand = mode == "on-demand"
+        self.gpu = bool(cfg.get("gpu"))
+        self.timeout = float(cfg.get("timeout_s", 120))
+        self.vram_mib = int(cfg.get("vram_mib", 2048))
+        if not math.isfinite(self.timeout) or self.timeout <= 0 or self.vram_mib <= 0:
+            raise ValueError("vision timeout_s and vram_mib must be positive")
+        self.memory_lease = contextlib.nullcontext
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
+        if self.on_demand:
+            args.append("--once")
         if cfg.get("gpu"):
             args.append("--gpu")
         if cfg.get("threads"):
             args += ["--threads", str(cfg["threads"])]
-        if cfg.get("max_tokens"):
-            args += ["--max-tokens", str(cfg["max_tokens"])]
+        max_tokens = cfg.get("max_tokens") or (1024 if self.on_demand else 0)
+        if max_tokens:
+            args += ["--max-tokens", str(max_tokens)]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        self.dir = self.work_dir()
+        if self.on_demand:
+            # Keep cached embeddings on disk: /tmp can be a tmpfs (persistent host RAM per image).
+            parent = Path(cfg.get("cache_dir") or Path.home() / ".cache/strata/vision")
+            if " " in str(parent):
+                if cfg.get("cache_dir"):
+                    raise ValueError("vision.cache_dir must be a disk path without spaces (the GENI protocol)")
+                parent = (Path(os.environ.get("SystemDrive", "C:") + os.sep) / "strata-vision-cache"
+                          if os.name == "nt" else Path("/var/tmp/strata-vision-cache"))
+            parent.mkdir(parents=True, exist_ok=True)
+            self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+        else:
+            self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
-        self._start()
+        self.proc = None
+        if not self.on_demand:
+            self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
@@ -1719,7 +1753,7 @@ class Vision:
         self.stopped = False
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -1728,6 +1762,9 @@ class Vision:
 
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
+        if self.on_demand:
+            self.stopped = False
+            return
         try:
             self.proc.kill()
         except OSError:
@@ -1812,12 +1849,20 @@ class Vision:
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
-                self.proc.stdin.flush()
-                line = self.proc.stdout.readline().strip()
+                if getattr(self, "on_demand", False):
+                    with self.memory_lease():
+                        line = self._encode_once(img, out)
+                else:
+                    self.proc.stdin.write(f"ENC {img.name} {out.name}\n")  # relative to the encoder's cwd (#480)
+                    self.proc.stdin.flush()
+                    line = self.proc.stdout.readline().strip()
+            except BaseException:
+                out.unlink(missing_ok=True)
+                raise
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
+                out.unlink(missing_ok=True)
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
@@ -1826,13 +1871,58 @@ class Vision:
                 self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
+    def _encode_once(self, img: Path, out: Path) -> str:
+        """Wait for process exit BEFORE returning embeddings or restoring the expert cache, including on failure."""
+        args, log, env = self.spawn
+        proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", env=env, cwd=self.dir)
+        self.proc = proc
+        self.stopped = False
+        started = time.monotonic()
+        try:
+            contain(proc)
+            try:
+                stdout, _ = proc.communicate(f"ENC {img.name} {out.name}\n", timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                raise ValueError(f"the vision encoder timed out after {self.timeout:g} seconds") from None
+            lines = stdout.splitlines()
+            errors = [line for line in lines if line.startswith("ERR")]
+            if errors:
+                return errors[-1]
+            if proc.returncode or not lines or not lines[0].startswith("READY "):
+                raise ValueError(f"the vision encoder stopped (exit code {proc.returncode})")
+            line = next((line for line in lines if line.startswith("OK ")), "")
+            try:
+                with out.open("rb") as f:
+                    magic, n, nx, ny, width = struct.unpack("<5i", f.read(20))
+                valid = magic == 0x31455653 and n > 0 and nx > 0 and ny > 0 and nx * ny == n and width > 0
+                valid = valid and line.split()[1] == str(n) and out.stat().st_size == 20 + n * width * 4
+            except (OSError, ValueError, IndexError, struct.error):
+                valid = False
+            if not valid:
+                raise ValueError("the vision encoder produced invalid embeddings")
+            return line
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()  # reap even a killed child: no CUDA context or pinned buffers can survive this point
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe is not None:
+                    pipe.close()
+            self.proc = None
+            self.last_encode = {"pid": proc.pid, "exit_code": proc.returncode,
+                                "elapsed_s": time.monotonic() - started}
+
     def close(self):
+        if self.proc is None:
+            return
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+            self.proc.wait()
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -2224,6 +2314,58 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+class VisionGate:
+    """Text requests share the GPU; an on-demand encoder waits for all of them and excludes new admissions."""
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.readers = self.writers = 0
+        self.encoding = False
+
+    @contextlib.contextmanager
+    def shared(self, cancel):
+        admitted = False
+        with self.cv:
+            while (self.encoding or self.writers) and not cancel.is_set():
+                self.cv.wait(0.1)
+            if not cancel.is_set():
+                self.readers += 1
+                admitted = True
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self.cv:
+                    self.readers -= 1
+                    self.cv.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self, timeout=300, cancel=None):
+        deadline = time.monotonic() + timeout
+        admitted = False
+        with self.cv:
+            self.writers += 1
+            try:
+                while self.encoding or self.readers:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise ModelBusy("text requests are still running; try the image again when they finish")
+                    self.cv.wait(min(left, .1) if cancel is not None else left)
+                if cancel is None or not cancel.is_set():
+                    self.encoding = admitted = True
+            finally:
+                self.writers -= 1
+                self.cv.notify_all()
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self.cv:
+                    self.encoding = False
+                    self.cv.notify_all()
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -2236,6 +2378,9 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        self.vision_gate = VisionGate() if getattr(vision, "on_demand", False) else None
+        if self.vision_gate is not None:
+            vision.memory_lease = self._vision_memory_lease
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -2394,7 +2539,55 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
-        return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+        return (self.vision is not None and not getattr(self.vision, "on_demand", False)
+                and hasattr(self.vision, "alive") and not self.vision.alive())
+
+    def _encode_images(self, sources):
+        gate = self.vision_gate.exclusive() if self.vision_gate is not None else contextlib.nullcontext()
+        with gate, self.fifo:
+            return [self.vision.encode(src) for src in sources]
+
+    @contextlib.contextmanager
+    def _vision_memory_lease(self):
+        # The exclusive gate and FIFO are held. Cache hits never enter here. No persistent reserve is changed.
+        if not self.vision.gpu:
+            yield
+            return
+        free = self.free_vram_mib()
+        if free is None:
+            raise ValueError("cannot read free GPU memory for on-demand vision")
+        borrowed = self.loaded() and free < self.vision.vram_mib
+        if not borrowed and free < self.vision.vram_mib:
+            raise ValueError(f"vision needs {self.vision.vram_mib} MiB free; only {free} MiB are available")
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        with ctl if ctl is not None else contextlib.nullcontext():
+            if borrowed:
+                if not hasattr(self.engine, "vision_vram"):
+                    raise ValueError("on-demand GPU vision needs an engine with temporary VRAM leases")
+                try:
+                    available = self.engine.vision_vram(self.vision.vram_mib)
+                except Exception:
+                    self.engine.unload()  # an interrupted control command has uncertain cache state
+                    raise
+            try:
+                if borrowed and available.get("vram_free_mib", 0) < self.vision.vram_mib:
+                    raise ValueError("the expert cache cannot release enough VRAM for this image encoder")
+                yield
+            finally:
+                if borrowed:
+                    try:
+                        encoder_free = self.free_vram_mib()  # child has been reaped before the lease closes
+                        restored = self.engine.vision_vram(None)
+                        if ("expert_slots_before" in available and
+                                restored.get("expert_slots") != available["expert_slots_before"]):
+                            raise ValueError("the vision lease did not restore every expert cache slot")
+                        self.vision.last_memory = {"before_mib": free, "encoder_exited_free_mib": encoder_free,
+                                                   "restored": dict(restored)}
+                        print(f"[strata] vision encoder exited; expert cache restored to "
+                              f"{restored.get('expert_slots')} slots, {restored.get('vram_free_mib')} MiB free", flush=True)
+                    except Exception:
+                        self.engine.unload()  # never resume text with an incomplete low-RAM cache restoration
+                        raise
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -2808,8 +3001,7 @@ class Service:
                     try:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self.fifo:          # the encoder takes its turn with the requests (see below)
-                            self.vision.encode(src)
+                        self._encode_images([src])
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
@@ -2841,8 +3033,7 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+            encoded = self._encode_images(images)
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -2994,7 +3185,10 @@ class Service:
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            with (contextlib.nullcontext(True) if par else cancellable_lock(self.fifo, cancel)) as acquired:
+            gate = (self.vision_gate.exclusive(cancel=cancel) if emb else self.vision_gate.shared(cancel)) \
+                if self.vision_gate is not None else contextlib.nullcontext(True)
+            with gate as admitted, (contextlib.nullcontext(True) if par else cancellable_lock(self.fifo, cancel)) as acquired:
+                acquired = acquired and admitted
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -4866,7 +5060,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 def engine_config_from_args(ap, a) -> dict:
     """Choose one settings source; native argv is never reparsed or loaded from disk."""
-    direct = any(value is not None for value in (a.exe, a.cwd, a.log, a.model_name)) or bool(a.lib_dir or a.engine_args)
+    direct_vision = any(getattr(a, key, None) is not None for key in
+                        ("vision_exe", "vision_mmproj", "vision_model", "vision_mode", "vision_max_tokens", "vision_vram_mib"))
+    direct_vision = direct_vision or getattr(a, "vision_gpu", False)
+    direct = any(value is not None for value in (a.exe, a.cwd, a.log, a.model_name)) or bool(a.lib_dir or a.engine_args) or direct_vision
     if a.config:
         if direct:
             ap.error("--config cannot be combined with direct engine settings or arguments after --")
@@ -4884,6 +5081,19 @@ def engine_config_from_args(ap, a) -> dict:
                 cfg[key] = getattr(a, key)
         if a.lib_dir:
             cfg["lib_dirs"] = list(a.lib_dir)
+        if direct_vision:
+            if not all((a.vision_exe, a.vision_mmproj, a.vision_model)):
+                ap.error("vision needs --vision-exe, --vision-mmproj and --vision-model")
+            if a.vision_max_tokens is not None and a.vision_max_tokens < 1:
+                ap.error("--vision-max-tokens must be positive")
+            if a.vision_vram_mib is not None and a.vision_vram_mib < 1:
+                ap.error("--vision-vram-mib must be positive")
+            cfg["vision"] = {"exe": a.vision_exe, "mmproj": a.vision_mmproj, "model": a.vision_model,
+                             "mode": a.vision_mode or "resident", "gpu": a.vision_gpu}
+            for key in ("max_tokens", "vram_mib"):
+                value = getattr(a, "vision_" + key)
+                if value is not None:
+                    cfg["vision"][key] = value
     else:
         if a.engine == "strata":
             ap.error("--engine strata needs direct settings or legacy --config")
@@ -4905,6 +5115,13 @@ def parse_server_options(argv=None):
     ap.add_argument("--log", help="native engine append-log path")
     ap.add_argument("--alias", dest="model_name", help="API model name")
     ap.add_argument("--lib-dir", action="append", help="native library directory (repeatable, order preserved)")
+    ap.add_argument("--vision-exe", help="strata-vision executable (on-demand needs a build supporting --once)")
+    ap.add_argument("--vision-mmproj", help="vision projector GGUF")
+    ap.add_argument("--vision-model", help="text model first GGUF shard, opened vocab-only by the encoder")
+    ap.add_argument("--vision-mode", choices=["resident", "on-demand"], help="resident (default) or load/encode/exit for each new image")
+    ap.add_argument("--vision-gpu", action="store_true", help="encode images on the GPU (otherwise CPU)")
+    ap.add_argument("--vision-max-tokens", type=int, help="image token cap (on-demand default: 1024)")
+    ap.add_argument("--vision-vram-mib", type=int, help="temporary free VRAM needed for GPU encoding (default: 2048 MiB)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -4981,10 +5198,11 @@ def main(argv=None) -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-        if lazy and cfg.get("vision"):
+        if lazy and cfg.get("vision") and cfg["vision"].get("mode") != "on-demand":
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
+            print("vision encoder on demand (unloaded)" if cfg["vision"].get("mode") == "on-demand" else
+                  "loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)

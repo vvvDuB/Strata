@@ -54,7 +54,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string mmproj, model;
-    bool gpu = false;
+    bool gpu = false, once = false;
     int threads = 0, max_tokens = 0, min_tokens = 0;
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
     for (int i = 1; i < argc; ++i) {
@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
         if (a == "--mmproj") mmproj = next();
         else if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
+        else if (a == "--once") once = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else if (a == "--min-tokens") min_tokens = std::atoi(next().c_str());   // mtmd image_min_tokens (#767)
@@ -78,7 +79,7 @@ int main(int argc, char** argv) {
     }
     if (mmproj.empty() || model.empty()) {
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
-                             "[--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
+                             "[--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto] [--once]\n");
         return 2;
     }
     // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (measured: 0.4-0.7 GB of VRAM,
@@ -148,7 +149,7 @@ int main(int argc, char** argv) {
     // On the CPU there is no VRAM to reserve, and the warm-up would only delay the engine's start by one encode
     // (~6 s at 1,024 tokens).
     if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
-    else {
+    else if (!once) {
         const auto warm_t0 = std::chrono::steady_clock::now();
         const uint32_t side = 2048;
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
@@ -178,11 +179,19 @@ int main(int argc, char** argv) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
         std::string img, out;
-        if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
+        if (!parse_enc(line, img, out)) {
+            std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout);
+            if (once) break;
+            continue;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
                                                                             mtmd_helper_init_opt_default());
-        if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
+        if (!bw.bitmap) {
+            std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout);
+            if (once) break;
+            continue;
+        }
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         const std::string prompt = mtmd_default_marker();
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
@@ -221,6 +230,7 @@ int main(int argc, char** argv) {
         mtmd_input_chunks_free(chunks);
         mtmd_bitmap_free(bw.bitmap);
         if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
+        if (once) break;  // process exit releases weights, CUDA context and all host/device work buffers
     }
     mtmd_free(ctx);
     llama_model_free(text);

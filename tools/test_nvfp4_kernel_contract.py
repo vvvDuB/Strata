@@ -37,7 +37,7 @@ class Nvfp4KernelContract(unittest.TestCase):
 
     def test_sanitizer_runner_covers_exhaustive_unpack_gate(self):
         text = (ROOT/'tools/run_nvfp4_gpu_checks.sh').read_text()
-        self.assertEqual(text.count('for test in kv_nvfp4_native_conversion kv_nvfp4_gpu_test kv_nvfp4_unpack_test; do'), 2,
+        self.assertEqual(text.count('for test in kv_nvfp4_native_conversion kv_nvfp4_gpu_test kv_nvfp4_unpack_test kv_nvfp4_elastic_test; do'), 2,
                          'unpack gate must run normally and under all four sanitizers')
 
     def test_opt_in_cli_and_resident_only_guard_are_integrated(self):

@@ -7736,6 +7736,8 @@ int main(int argc, char** argv) {
         // again and puts each slot's expert back (or, when the adaptive tier already brought that one back, the
         // most-routed missing expert of the same layer); the adaptive tier carries on from there.
         std::vector<std::pair<int32_t, int32_t>> vram_evicted;   // (residency index, slot) the shrinks took
+        int64_t vision_cache_bytes = -1;   // an idle-only lease; END restores the exact preceding cache size
+        long long cache_reserve_mib = o.vram_reserve_mib;
         const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
         auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
             if (pf_parts.empty() || pf_parts[0].first < 0) return;
@@ -7752,16 +7754,26 @@ int main(int argc, char** argv) {
             p.first_now = -1;   // laid out again at the next loan
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
+            const bool begin = cmd.rfind("VRAM BEGIN ", 0) == 0;
+            const bool finish = cmd == "VRAM END";
+            if (begin && vision_cache_bytes >= 0) { e = "VRAM: a vision lease is already open"; return false; }
+            if (finish && vision_cache_bytes < 0) { e = "VRAM: no vision lease to restore"; return false; }
+            if (!begin && !finish && vision_cache_bytes >= 0) {
+                e = "VRAM: restore the vision lease first"; return false;
+            }
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
             char* end = nullptr;
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
-            const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
-            if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+            const char* value = cmd.c_str() + (begin ? 11 : 4);
+            const long long reserve = finish ? cache_reserve_mib : bare ? (long long) o.vram_reserve_mib : std::strtoll(value, &end, 10);
+            if (!finish && !bare && (end == value || reserve < 0 || reserve > INT64_MAX / (1LL << 20) || *end)) {
+                e = "expected: VRAM [reserve_mib] or VRAM BEGIN reserve_mib or VRAM END"; return false;
+            }
             if (!xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (src.complement_ready()) {
+            if (src.complement_ready() && !begin && !finish) {
                 e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
@@ -7778,14 +7790,18 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
+            if (begin) vision_cache_bytes = mapped;
             const int64_t before = xcache.slots();
             // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
             const int64_t floor_slots = std::min<int64_t>(xcache.full_slots(),
                 128 + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256)));
             std::string note;
-            if ((int64_t) free_b < want_free) {
+            if (!finish && (int64_t) free_b < want_free) {
                 const int64_t floor_b = xcache.bytes_of(floor_slots);
                 int64_t keep = mapped - (want_free - (int64_t) free_b);
+                // shrink() rounds UP. A temporary encoder needs at least the requested free memory, so retain
+                // only complete segments within this budget (except the mandatory prompt-buffer floor).
+                if (begin) keep = keep / xcache.segment_bytes() * xcache.segment_bytes();
                 if (keep < floor_b) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
@@ -7798,9 +7814,13 @@ int main(int argc, char** argv) {
                         host_res[i] = strata::core::kNotResident;
                     }
                 res_upload();
-            } else if (mapped < xcache.full_bytes()) {
+            } else if (!begin && mapped < (finish ? vision_cache_bytes : xcache.full_bytes())) {
                 std::string gerr;
-                if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
+                const int64_t target = finish ? vision_cache_bytes : mapped + ((int64_t) free_b - want_free);
+                if (!xcache.grow(target, gerr)) {
+                    if (finish) { e = "VRAM: restoring the vision lease failed: " + gerr; return false; }
+                    note = " (" + gerr + ")";
+                }
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
@@ -7825,12 +7845,18 @@ int main(int argc, char** argv) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
+                    // Low-RAM file reads can return a reusable staging buffer. Complete this DMA before the
+                    // next blob() overwrites it. Resident arena pointers keep the normal batched refill.
+                    if (srcp == &src && !src.resident_blob(layer, pick % g.n_expert) &&
+                        !xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
                     host_res[(size_t) pick] = slot;
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
                 res_upload();
             }
+            if (finish) vision_cache_bytes = -1;
+            if (!begin && !finish) cache_reserve_mib = reserve;
             relend();
             cudaMemGetInfo(&free_b, &total_b);
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
@@ -7840,10 +7866,10 @@ int main(int argc, char** argv) {
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
             std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld expert_slots_before=%lld\n", reserve,
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
-                        (long long) (free_b >> 20), (long long) o.prefill_chunk);
+                        (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) before);
             return true;
         };
         // ---- --batch: the slots of the batch windows
@@ -8245,6 +8271,11 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (vision_cache_bytes >= 0 && line != "QUIT") {
+                std::printf("ERR restore the vision VRAM lease before text inference\n");
+                std::fflush(stdout);
+                continue;
+            }
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
@@ -8558,6 +8589,15 @@ int main(int argc, char** argv) {
             }
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
+            struct ImageBuffers {
+                std::vector<float>& rows;
+                std::vector<const float*>& pointers;
+                ~ImageBuffers() {
+                    // Only embeddings for this prompt: retain hashes in the conversation cache, not host rows.
+                    std::vector<float>().swap(rows);
+                    std::vector<const float*>().swap(pointers);
+                }
+            } image_buffers{img_rows, row_ptr};
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request

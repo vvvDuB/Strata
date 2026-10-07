@@ -1,0 +1,109 @@
+{
+  "feature": "vision-on-demand",
+  "date": "2026-10-07",
+  "source_parent": "83ce23c1c9d940b3b49afc79d4fc04a662102fb8",
+  "native_source_hash": "3033991be504c74e",
+  "vision_source_hash": "8164391db296f39f",
+  "hardware": {
+    "gpu": "RTX 5070 SM120 12 GiB",
+    "cuda": "13.4",
+    "cpu": "Ryzen 7 5700X3D AVX2",
+    "ram_gib": 32
+  },
+  "profile": {
+    "kv": "nvfp4",
+    "context": 131072,
+    "resident_experts_gib": 22,
+    "unchanged_vram_reserve_mib": 640,
+    "vision_temporary_free_mib": 1408,
+    "image_token_cap": 1024,
+    "cache_segment_mib": 64
+  },
+  "binaries": {
+    "strata_sha256": "8cfa414e40bab66fb7a4eb48e4b609a6ead3faa7db219d55d1f27681d243ef3e",
+    "vision_sha256": "1983f9955e5c76bc116ba95c4f9d162b6f1ba135a38fc89d5d3e24cdf9d54bfd"
+  },
+  "tests": {
+    "serve": {
+      "run": 514,
+      "skipped": 8,
+      "failures": 0
+    },
+    "tools": {
+      "run": 509,
+      "skipped": 4,
+      "failures": 0
+    },
+    "native_cache_and_expert_source": {
+      "run": 5,
+      "failures": 0
+    },
+    "vision_compute_sanitizer_memcheck": {
+      "errors": 0
+    }
+  },
+  "encoder": [
+    {
+      "side": 448,
+      "elapsed_s": 1.1825879929965595,
+      "extra_vram_mib": 1190.1875,
+      "peak_rss_mib": 693.8515625,
+      "baseline_mib": 378.875,
+      "after_mib": 378.875,
+      "process_gone": true,
+      "header": [
+        826627667,
+        196,
+        14,
+        14,
+        2560
+      ]
+    },
+    {
+      "side": 2048,
+      "elapsed_s": 1.3607233279981301,
+      "extra_vram_mib": 1314.1875,
+      "peak_rss_mib": 705.0859375,
+      "baseline_mib": 378.875,
+      "after_mib": 378.875,
+      "process_gone": true,
+      "header": [
+        826627667,
+        1024,
+        32,
+        32,
+        2560
+      ]
+    }
+  ],
+  "resident_vs_on_demand_embeddings": {
+    "byte_identical": true,
+    "tokens": 1024,
+    "width": 2560,
+    "sha256": "cc2c1181fc8eadfb8e4ac8616bf7ea2de477d0d4d44d025ce80a5de2d4556eb5"
+  },
+  "live_api": {
+    "openai": true,
+    "anthropic": true,
+    "responses_two_images": true,
+    "invalid_image_http_status": 400,
+    "invalid_image_free_mib_before": 133.9375,
+    "invalid_image_free_mib_after": 133.9375,
+    "text_answer_before": "4",
+    "text_answer_after": "4",
+    "cached_image_starts_no_encoder": true,
+    "every_observed_encoder_reaped": true,
+    "expert_slots_restored": 2835,
+    "prompt_chunk_restored": 8192,
+    "server_anon_mib_before": 197.47265625,
+    "server_anon_mib_after": 199.4609375
+  },
+  "text_benchmark": {
+    "warm_runs": 4,
+    "tokens_per_run": 64,
+    "before_mean_tok_s": 37.45,
+    "on_demand_mean_tok_s": 37.15,
+    "note": "Adaptive GPU/CPU expert rounding also varies repeated completions in the baseline; no deterministic cache equivalence claim."
+  },
+  "remaining_decoder_memory": "Existing M-RoPE table, decoder graphs and conversation caches retain their existing multimodal lifecycle; encoder residency is zero."
+}

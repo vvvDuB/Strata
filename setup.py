@@ -4053,6 +4053,9 @@ def main() -> int:
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
+    ap.add_argument("--vision-mode", choices=["resident", "on-demand"], default="resident",
+                    help="on-demand loads the encoder for each new image and exits afterwards; requires a local "
+                         "build, GPU cache borrowing currently supports one NVIDIA GPU")
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
@@ -4649,6 +4652,10 @@ def main() -> int:
 
     # ---- 4. the engine
     step(4, "the Strata engine")
+    if vision != "none" and a.vision_mode == "on-demand":
+        if vision == "gpu" and (hip or multi):
+            fail("on-demand GPU vision needs one NVIDIA GPU", "use a single CUDA GPU for this mode")
+        a.build = True  # downloaded older encoders do not implement --once or temporary native cache leases
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
@@ -4848,8 +4855,13 @@ def main() -> int:
     if budget is not None and not q4_split:   # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N
         args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split has no budget)
     if vision != "none":
-        args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
-        if vision == "gpu" and a.vram_reserve_mib is None and 0 < gpu.get("vram_gb", 0.0) <= 12.5:
+        args.append("--vision")
+        if a.vision_mode == "on-demand":
+            if vision == "gpu":
+                args += ["--vram-elastic", "--vram-segment-mib", "64"]
+        else:
+            args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+        if a.vision_mode == "resident" and vision == "gpu" and a.vram_reserve_mib is None and 0 < gpu.get("vram_gb", 0.0) <= 12.5:
             # a tip only (recommend, never force): on a 12 GB card the encoder's 700 MiB can leave ~200 MiB free
             print(f"  tip: images on a {gpu['vram_gb']:.0f} GB card can leave little VRAM free; if a request stalls, "
                   f"run setup again with --vram-reserve-mib {VISION_GPU_SMALL_RESERVE_MIB}")
@@ -4926,6 +4938,8 @@ def main() -> int:
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(shards[0]),
                          "gpu": vision == "gpu", "max_tokens": vt}
+        if a.vision_mode == "on-demand":
+            cfg["vision"]["mode"] = "on-demand"
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     elif a.vision_tokens is not None:
