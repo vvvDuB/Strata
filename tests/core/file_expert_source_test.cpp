@@ -28,6 +28,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -485,6 +487,163 @@ void test_unbuffered_reads() {
     source.close();
 }
 
+// The LRU retains decode reads. Prompt copies can reuse them but must neither admit nor refresh entries.
+void test_decode_lru() {
+    using namespace strata::core;
+    using strata::kernels::cpu::BLOB;
+    constexpr int64_t layers = 4, experts = 8;
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(strata::kernels::cpu::expert_layout_load(dir.path.string(), layers, experts, err), err);
+    std::vector<std::pair<uint64_t, char>> markers;
+    for (int64_t e = 0; e < experts; ++e) {
+        markers.emplace_back((uint64_t)e * BLOB, (char)(e + 1));
+        markers.emplace_back((uint64_t)(e + 1) * BLOB - 1, (char)(100 + e));
+    }
+    create_pack(dir.path, (uint64_t)layers * experts * BLOB, markers);
+    FileExpertSource src;
+    require(src.open(dir.path.string(), layers, experts, err), err);
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = src.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    require(direct, "LRU requires working direct reads: " + why);
+    src.set_stage_keep(4 * BLOB);
+    src.begin_layer(0, nullptr, 0);
+    const int64_t first[] = {0, 1, 2, 3};
+    src.prefetch(0, first, 4);
+    require(src.file_read_bytes() == 4 * BLOB && src.lru_live_bytes() == 4 * BLOB,
+            "initial LRU did not retain exactly four file reads");
+    std::vector<uint8_t> dst(BLOB + 2, 0xA5);
+    auto copy = [&](int64_t expert, bool hit) {
+        const uint64_t before = src.file_read_bytes();
+        require(src.copy_blob(0, expert, dst.data() + 1), "LRU prompt copy failed");
+        require(dst.front() == 0xA5 && dst.back() == 0xA5 && dst[1] == expert + 1 && dst[BLOB] == 100 + expert,
+                "LRU prompt copy returned wrong bytes or overwrote a guard");
+        require(src.file_read_bytes() - before == (hit ? 0 : BLOB), "LRU hit/miss performed unexpected disk reads");
+    };
+    // Age the entries beyond the protected working window; a prompt hit must not save the oldest one.
+    for (int64_t l = 1; l < layers; ++l) src.begin_layer(l, nullptr, 0);
+    copy(0, true);
+    const int64_t fourth = 4;
+    src.prefetch(0, &fourth, 1);
+    copy(0, false);
+    copy(1, true);
+    const int64_t hot = 1, fifth = 5;
+    src.prefetch(0, &hot, 1);  // Decode refreshes recency and protects this entry.
+    src.prefetch(0, &fifth, 1);
+    copy(1, true);
+    copy(2, false);
+    require(src.staged_decode_hits() == 1, "decode LRU reuse was not counted");
+    const int32_t ls[] = {0, 0, 0}, es[] = {1, 3, 0};
+    std::vector<std::vector<uint8_t>> outputs(3, std::vector<uint8_t>(BLOB + 2, 0xA5));
+    uint8_t* targets[] = {outputs[0].data() + 1, outputs[1].data() + 1, outputs[2].data() + 1};
+    const uint64_t before = src.file_read_bytes();
+    require(src.copy_blobs(ls, es, targets, 3), "mixed LRU/file batch failed");
+    require(src.file_read_bytes() - before == BLOB, "mixed batch did not reuse the two retained experts");
+    for (size_t i = 0; i < 3; ++i)
+        require(outputs[i].front() == 0xA5 && outputs[i].back() == 0xA5 &&
+                    targets[i][0] == es[i] + 1 && targets[i][BLOB - 1] == 100 + es[i],
+                "mixed LRU/file batch returned wrong bytes or overwrote a guard");
+    copy(6, false);
+    copy(7, false);
+    copy(1, true);
+    require(src.lru_live_bytes() == 4 * BLOB, "prompt scans changed LRU capacity");
+    src.close();
+    require(src.lru_live_bytes() == 0 && src.staged_decode_hits() == 0 && src.staged_prompt_hits() == 0,
+            "close retained LRU buffers or session counters");
+}
+
+// Exercise the real 1 GiB floor, watcher, concurrent prompt copies, release of Linux pages, and regrowth.
+void test_elastic_lru() {
+    using namespace strata::core;
+    using strata::kernels::cpu::BLOB;
+    constexpr int64_t layers = 8, experts = 104;
+    constexpr uint64_t floor = 1ull << 30;
+    const uint64_t capacity = (uint64_t)layers * experts * BLOB;
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(strata::kernels::cpu::expert_layout_load(dir.path.string(), layers, experts, err), err);
+    std::vector<std::pair<uint64_t, char>> markers;
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < experts; ++e) {
+            const uint64_t at = (uint64_t)(l * experts + e) * BLOB;
+            markers.emplace_back(at, (char)(l + 1));
+            markers.emplace_back(at + 1, (char)(e + 1));
+        }
+    create_pack(dir.path, capacity, markers);
+    FileExpertSource src;
+    require(src.open(dir.path.string(), layers, experts, err), err);
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = src.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    require(direct, "elastic LRU requires direct reads: " + why);
+    src.set_stage_keep(capacity);
+    auto populate = [&] {
+        for (int64_t l = 0; l < layers; ++l) {
+            src.begin_layer(l, nullptr, 0);
+            for (int64_t e = 0; e < experts; ++e) {
+                const uint8_t* p = src.blob(l, e);
+                require(p && p[0] == l + 1 && p[1] == e + 1, "elastic LRU returned wrong expert bytes");
+            }
+        }
+    };
+    populate();
+    require(src.lru_live_bytes() == capacity, "elastic fixture did not fill the configured LRU");
+    const uint8_t* protected_blob = src.blob(layers - 1, experts - 1);
+    auto rss = []() -> uint64_t {
+#if defined(__linux__)
+        std::ifstream f("/proc/self/status");
+        std::string key, line;
+        while (f >> key) {
+            if (key == "VmRSS:") { uint64_t n = 0; f >> n; return n * 1024; }
+            std::getline(f, line);
+        }
+#endif
+        return 0;
+    };
+    const uint64_t rss_before = rss();
+    // An unattainable floor deterministically simulates pressure without consuming another process's RAM.
+    src.start_elastic_lru(std::numeric_limits<uint64_t>::max() / 4);
+    std::atomic<bool> quit{false}, bad_copy{false};
+    std::thread reader([&] {
+        std::vector<uint8_t> copy(BLOB);
+        while (!quit.load()) {
+            if (!src.copy_blob(layers - 1, experts - 1, copy.data()) || copy[0] != layers || copy[1] != experts)
+                bad_copy.store(true);
+            (void)src.lru_live_bytes();  // Concurrent stats must synchronize with the watcher.
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (src.lru_live_bytes() > floor && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    quit.store(true);
+    reader.join();
+    require(!bad_copy.load(), "watcher changed bytes being copied by the prompt path");
+    const uint64_t held = src.lru_live_bytes();
+    require(held <= floor && held + BLOB > floor && src.lru_freed() > 0,
+            "elastic watcher did not shrink to its one-blob-rounded 1 GiB floor");
+    require(protected_blob[0] == layers && protected_blob[1] == experts,
+            "watcher freed a buffer still protected by the current decode layer");
+#if defined(__linux__)
+    require(rss_before > rss() + (32ull << 20), "Linux LRU shrink did not return physical pages to the OS");
+#endif
+    const uint64_t before = src.file_read_bytes();
+    std::vector<uint8_t> cold(BLOB);
+    require(src.copy_blob(0, 0, cold.data()) && cold[0] == 1 && cold[1] == 1,
+            "an evicted expert could not be read again");
+    require(src.file_read_bytes() == before + BLOB, "evicted expert remained incorrectly cached");
+    src.start_elastic_lru(1);  // Available memory permits cap growth on the next watcher tick.
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    populate();
+    require(src.lru_live_bytes() == capacity, "elastic LRU did not regrow into its freed slots");
+    src.close();  // Stops and joins the watcher before releasing buffers.
+    require(src.lru_live_bytes() == 0 && src.lru_freed() == 0, "elastic close retained memory or counters");
+    std::cout << "elastic LRU: shrink, concurrent copies, page release and regrowth OK\n";
+}
+
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
@@ -654,6 +813,8 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_decode_lru();
+        if (argc == 2 && std::string(argv[1]) == "--lru-elastic") test_elastic_lru();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

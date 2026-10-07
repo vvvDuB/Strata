@@ -1,0 +1,100 @@
+{
+  "date": "2026-10-07",
+  "base_commit": "157d2898fdcaaf2efeaa687ab505f1d62b3a5b3d",
+  "worktree_dirty": true,
+  "binary_sha256": "b3ddfbafa535f4897e524236a48d03210fe7cb49f11881bfc0eb6be3cf6e5345",
+  "hardware": {
+    "gpu": "RTX 5070 12 GiB SM120",
+    "cpu": "Ryzen 5700X3D",
+    "ram_gib": 32,
+    "cuda": "13.4"
+  },
+  "configuration": {
+    "kv": "nvfp4",
+    "kv_resident": 0,
+    "kv_grow": true,
+    "vram_elastic": true,
+    "vram_segment_mib": 64,
+    "context": 131072,
+    "resident_budget_gib": 22,
+    "vram_reserve_mib": 640,
+    "vision_mode": "on-demand"
+  },
+  "short_benchmark": {
+    "warmup_requests": 6,
+    "measured_requests": 6,
+    "max_new_tokens": 96,
+    "baseline_mean_tok_s": 37.7,
+    "updated_mean_tok_s": 41.166666666666664,
+    "change_percent": 9.195402298850563,
+    "baseline_slots": 2835,
+    "updated_slots": 3354
+  },
+  "validation": {
+    "native_gpu_ctest_passed": 2,
+    "rebuilt_source_profile_ctest_passed": 2,
+    "vision_server_tests_passed": 16,
+    "compute_sanitizer_errors": 0,
+    "long_prompt_tokens": 40045,
+    "long_mapped_cells": 40960,
+    "vision_before_slots": 3256,
+    "vision_during_slots": 2478,
+    "vision_restored_slots": 3256,
+    "short_restored_slots": 3354,
+    "short_kv_cells": 8192,
+    "cached_image_tokens": 218,
+    "decode_prompt_tokens": 16033,
+    "decode_generated_tokens": 512,
+    "decode_mapped_cells": 24576,
+    "invalid_image_http_status": 400,
+    "text_after_failure": "4",
+    "service_active": false,
+    "monitor_runtime_info_tests_passed": 4,
+    "monitor_metrics_transitions": [
+      {
+        "state": "idle",
+        "expert_slots": 3354,
+        "expert_cache_mib": 5607,
+        "kv_cells": 16384
+      },
+      {
+        "state": "reading",
+        "expert_slots": 3256,
+        "expert_cache_mib": 5439,
+        "kv_cells": 40960
+      },
+      {
+        "state": "generating",
+        "expert_slots": 3256,
+        "expert_cache_mib": 5439,
+        "kv_cells": 40960
+      },
+      {
+        "state": "reading",
+        "expert_slots": 3256,
+        "expert_cache_mib": 5439,
+        "kv_cells": 40960
+      },
+      {
+        "state": "reading",
+        "expert_slots": 3354,
+        "expert_cache_mib": 5607,
+        "kv_cells": 8192
+      },
+      {
+        "state": "generating",
+        "expert_slots": 3354,
+        "expert_cache_mib": 5607,
+        "kv_cells": 8192
+      },
+      {
+        "state": "idle",
+        "expert_slots": 3354,
+        "expert_cache_mib": 5607,
+        "kv_cells": 8192
+      }
+    ],
+    "server_tests_run": 518,
+    "server_tests_summary": "OK (skipped=8)"
+  }
+}

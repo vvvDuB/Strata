@@ -1,0 +1,380 @@
+{
+  "completed": true,
+  "binary_sha256": "bf3302e66e4f33e36d6769bafca62a35eacd0c1e98b471601100635651a25cee",
+  "arms": {
+    "A": {
+      "requests": 16,
+      "generated": 8192,
+      "decode_tok_s": 24.00192202891247,
+      "decode_s": 341.306,
+      "file_mb": 349054.3,
+      "file_mb_per_token": 42.60916748046875,
+      "request_read_gib": 364.407657623291,
+      "wall_s": 355.01214340599836,
+      "ttft_s": 0.9215106337469479,
+      "max_gap_s": 4.284952347996295,
+      "run_decode_tok_s": [
+        29.673139071830587,
+        20.150667564657027
+      ],
+      "cycle_decode_tok_s": {
+        "1": 30.8007441507913,
+        "2": 19.661850729302973
+      },
+      "topic_decode_tok_s": {
+        "garden": 30.883419614892208,
+        "systems": 33.49908400942162,
+        "science": 14.336997855050713,
+        "history": 28.84145508520763
+      },
+      "peak_rss_gib": [
+        26.699256896972656,
+        26.678604125976562
+      ],
+      "min_available_gib": [
+        3.085224151611328,
+        3.087963104248047
+      ],
+      "decode_samples": {
+        "count": 310,
+        "rss_median_gib": 26.647228240966797,
+        "available_min_gib": 3.113475799560547,
+        "seconds_under_10_tok_s": 68,
+        "disk_await_median_ms": 0.6704043601359927,
+        "disk_await_max_ms": 104.46210720887245,
+        "disk_mib_s_median": 1191.5380994214265
+      },
+      "slow_disk_samples": {
+        "count": 66,
+        "criterion": "measured decode only; NVMe read await >10 ms and busy >80%",
+        "seconds": 68.74124302298878,
+        "affected_requests": [
+          "science-2"
+        ],
+        "start_unix": 1791385620.7365608,
+        "end_unix": 1791385689.4778037,
+        "median": {
+          "tokens_per_s": 0.9598355379992767,
+          "disk_mib_s": 54.71678771091152,
+          "await_ms": 39.81169586232472,
+          "busy_percent": 97.54084522928522,
+          "gpu_power": 46.748
+        }
+      }
+    },
+    "B": {
+      "requests": 16,
+      "generated": 8192,
+      "decode_tok_s": 35.121024340344675,
+      "decode_s": 233.2506,
+      "file_mb": 239632.4,
+      "file_mb_per_token": 29.252001953125,
+      "request_read_gib": 266.9125213623047,
+      "wall_s": 247.84406562004006,
+      "ttft_s": 0.9779018470662777,
+      "max_gap_s": 0.1756945020024432,
+      "run_decode_tok_s": [
+        35.57300238398172,
+        34.68038754655732
+      ],
+      "cycle_decode_tok_s": {
+        "1": 35.56243960419422,
+        "2": 34.690432775005945
+      },
+      "topic_decode_tok_s": {
+        "garden": 36.65672090596513,
+        "systems": 40.09608965235046,
+        "science": 32.23897137531956,
+        "history": 32.622893370288956
+      },
+      "peak_rss_gib": [
+        26.110797882080078,
+        26.117565155029297
+      ],
+      "min_available_gib": [
+        3.691356658935547,
+        3.704345703125
+      ],
+      "decode_samples": {
+        "count": 209,
+        "rss_median_gib": 26.049671173095703,
+        "available_min_gib": 3.7257537841796875,
+        "seconds_under_10_tok_s": 0,
+        "disk_await_median_ms": 0.5913483247539059,
+        "disk_await_max_ms": 1.0829389588513676,
+        "disk_mib_s_median": 991.511779081399
+      },
+      "slow_disk_samples": {
+        "count": 0,
+        "criterion": "measured decode only; NVMe read await >10 ms and busy >80%",
+        "seconds": 0,
+        "affected_requests": [],
+        "start_unix": null,
+        "end_unix": null
+      }
+    }
+  },
+  "prefill": {
+    "8192": {
+      "A": {
+        "tok_s": 1198.4142077621898,
+        "per_run_tok_s": [
+          1187.5906059727458,
+          1209.4369149909942
+        ],
+        "per_run_ms": [
+          6898.0,
+          6773.4
+        ],
+        "read_gib": [
+          19.41950225830078,
+          19.416179656982422
+        ],
+        "correct": [
+          true,
+          true
+        ],
+        "expert_slots": [
+          3354,
+          3354
+        ]
+      },
+      "B": {
+        "tok_s": 1106.959711909411,
+        "per_run_tok_s": [
+          1142.6817871141427,
+          1073.4033910741896
+        ],
+        "per_run_ms": [
+          7169.1,
+          7631.8
+        ],
+        "read_gib": [
+          21.157333374023438,
+          21.170379638671875
+        ],
+        "correct": [
+          true,
+          true
+        ],
+        "expert_slots": [
+          3354,
+          3354
+        ]
+      },
+      "delta_percent": -7.63129269166064
+    },
+    "32768": {
+      "A": {
+        "tok_s": 1427.199456437707,
+        "per_run_tok_s": [
+          1423.624838708276,
+          1430.792070561523
+        ],
+        "per_run_ms": [
+          23017.3,
+          22902.0
+        ],
+        "read_gib": [
+          66.63518524169922,
+          66.59360122680664
+        ],
+        "correct": [
+          true,
+          true
+        ],
+        "expert_slots": [
+          3256,
+          3256
+        ]
+      },
+      "B": {
+        "tok_s": 1340.3881513417996,
+        "per_run_tok_s": [
+          1338.8738390883498,
+          1341.9058929522093
+        ],
+        "per_run_ms": [
+          24474.3,
+          24419.0
+        ],
+        "read_gib": [
+          72.09334182739258,
+          71.97741317749023
+        ],
+        "correct": [
+          true,
+          true
+        ],
+        "expert_slots": [
+          3256,
+          3256
+        ]
+      },
+      "delta_percent": -6.082632998795323
+    }
+  },
+  "output_parity": [
+    {
+      "phase": "decode",
+      "name": "garden-1",
+      "observations": 4,
+      "unique_outputs": 3,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "systems-1",
+      "observations": 4,
+      "unique_outputs": 3,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "science-1",
+      "observations": 4,
+      "unique_outputs": 3,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "history-1",
+      "observations": 4,
+      "unique_outputs": 3,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "garden-2",
+      "observations": 4,
+      "unique_outputs": 4,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "systems-2",
+      "observations": 4,
+      "unique_outputs": 4,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "science-2",
+      "observations": 4,
+      "unique_outputs": 4,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "decode",
+      "name": "history-2",
+      "observations": 4,
+      "unique_outputs": 4,
+      "lengths": [
+        512,
+        512,
+        512,
+        512
+      ]
+    },
+    {
+      "phase": "prefill",
+      "name": "8192",
+      "observations": 4,
+      "unique_outputs": 1,
+      "lengths": [
+        4,
+        4,
+        4,
+        4
+      ]
+    },
+    {
+      "phase": "prefill",
+      "name": "32768",
+      "observations": 4,
+      "unique_outputs": 1,
+      "lengths": [
+        4,
+        4,
+        4,
+        4
+      ]
+    }
+  ],
+  "restoration": {
+    "service": "active",
+    "launcher_unchanged": true,
+    "native": [
+      {
+        "pid": 3910533,
+        "sha256": "bf3302e66e4f33e36d6769bafca62a35eacd0c1e98b471601100635651a25cee"
+      }
+    ],
+    "arithmetic_answer": "4",
+    "total_expert_budget_gib": 22,
+    "lru_gib": 4,
+    "kv": "nvfp4"
+  },
+  "delta": {
+    "decode_percent": 46.325882977364266,
+    "file_bytes_per_token_percent": -31.34810257315266,
+    "wall_time_percent": -30.187158320215246
+  },
+  "slow_disk_sensitivity": {
+    "method": "secondary matched-group sensitivity only; all primary records retained; omit each affected request name in ALL four processes",
+    "excluded_request_names": [
+      "science-2"
+    ],
+    "arms": {
+      "A": {
+        "requests": 14,
+        "generated": 7168,
+        "decode_tok_s": 30.4391509990819,
+        "file_mb_per_token": 41.37922712053571
+      },
+      "B": {
+        "requests": 14,
+        "generated": 7168,
+        "decode_tok_s": 35.555167552735035,
+        "file_mb_per_token": 28.385463169642858
+      }
+    },
+    "decode_percent": 16.807356268929595,
+    "file_bytes_per_token_percent": -31.401659371361955
+  }
+}

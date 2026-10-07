@@ -446,6 +446,7 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    uint64_t resident_lru = 0;          ///< --resident-lru-gib: the part of the RAM budget kept as an LRU of decode reads
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -691,9 +692,9 @@ void usage() {
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
-                 "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
-                 "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
-                 "                       allocated at start\n"
+                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
+                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
+                  "                       allocated at start. --serve --vram-elastic also supports the low-RAM tier\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -804,6 +805,8 @@ void usage() {
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
                  "  --prefill-stream-min N  stream all non-resident experts for chunks >= N (positive integer);\n"
                  "                       overrides STRATA_PREFILL_STREAM_MIN; absent: env or default 2048\n"
+                 "  --resident-lru-gib L  reserve L GiB within --resident-budget-gib for recently decoded file experts;\n"
+                 "                       STRATA_LRU_KEEP_FREE_GIB makes it elastic, STRATA_TIER_TRACE traces expert reads\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -1894,6 +1897,15 @@ int main(int argc, char** argv) {
             if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
+        else if (a == "--resident-lru-gib") {
+            const double gib = std::atof(next("--resident-lru-gib"));
+            if (!(gib > 0.0) || !std::isfinite(gib) ||
+                gib >= (double) std::numeric_limits<uint64_t>::max() / 1073741824.0) {
+                std::fprintf(stderr, "strata generate: --resident-lru-gib needs a finite N > 0 within range\n");
+                return 2;
+            }
+            o.resident_lru = (uint64_t) (gib * 1073741824.0);
+        }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
@@ -1926,6 +1938,10 @@ int main(int argc, char** argv) {
         else (void) cudaGetLastError();
     }
 #endif
+    if (o.resident_lru > 0 && o.resident_budget <= o.resident_lru) {
+        std::fprintf(stderr, "strata generate: --resident-lru-gib must be smaller than --resident-budget-gib\n");
+        return 2;
+    }
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
@@ -3503,14 +3519,15 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
+            const bool segmented_kv = o.vram_elastic && o.serve && o.vram_segment_mib >= 64;
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
-                            !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
+                            !o.expert_profile.empty() && (!o.resident_cpu_experts || segmented_kv) &&
+                            o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
-                            // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+                            o.batch == 0 && (!o.vram_elastic || segmented_kv) && o.peer_device < 0;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
-                                     "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+                                     "every expert in RAM or --serve --vram-elastic, no --batch or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
@@ -3822,9 +3839,25 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
+        // --resident-lru-gib: that much of the RAM budget is not filled from the profile at start but holds the experts
+        // the decode reads from the files, least recently used out first (the stage pool of the unbuffered reads)
+        if (o.resident_lru > 0) {
+            o.resident_budget -= o.resident_lru;
+            src.set_stage_keep(o.resident_lru);
+            // STRATA_LRU_KEEP_FREE_GIB=G: the LRU part is elastic - it shrinks when the available RAM falls below G (other
+            // programs get it back at once, nothing paged) and grows back towards its size when RAM is free again
+            if (const char* kf = std::getenv("STRATA_LRU_KEEP_FREE_GIB"); kf != nullptr && std::atof(kf) > 0.0) {
+                src.start_elastic_lru((uint64_t) (std::atof(kf) * 1073741824.0));
+                std::fprintf(stderr, "strata generate: RAM tier LRU is elastic: it keeps %.1f GiB of RAM available to "
+                                     "other programs\n", std::atof(kf));
+            }
+            std::fprintf(stderr, "strata generate: RAM tier: %.2f GiB by the expert profile, %.2f GiB of the experts the "
+                                 "decode reads from the files (LRU)\n", (double) o.resident_budget / 1073741824.0,
+                         (double) o.resident_lru / 1073741824.0);
+        }
         if (o.resident_budget > 0) {
             std::string why;
-            const bool ub = src.set_unbuffered(o.resident_budget, why);
+            const bool ub = src.set_unbuffered(o.resident_budget + o.resident_lru, why);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
                          ub ? "unbuffered" : "through the file cache", why.c_str());
         } else if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0' &&
@@ -5344,10 +5377,29 @@ int main(int argc, char** argv) {
         std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
         int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
     } kvg;
-    auto kvg_start = [&](int64_t top) {
-        kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
+    auto kvg_report = [&]() {
+        if (!o.serve || !kvg.on) return;
+        const int64_t slots = xcache.segmented() ? xcache.slots() : kvg.lo + xcache.slots() - kvg.top;
+        const int64_t bytes = xcache.segmented() ? xcache.bytes() :
+            xcache.vmm_range()->mapped_count() * (int64_t) strata::core::vmm_granularity();
+        std::printf("INFO expert_slots=%lld expert_cache_mib=%lld expert_slots_primary=%lld "
+                    "expert_cache_primary_mib=%lld kv_grow=1 kv_cells=%lld kv_mapped_mib=%lld\n",
+                    (long long) slots, (long long) (bytes >> 20), (long long) slots, (long long) (bytes >> 20),
+                    (long long) kvg.cells, (long long) (strata::core::qsa_kv_elastic_mapped_bytes() >> 20));
+        std::fflush(stdout);   // the monitor receives the resize before prefill or decode resumes
+    };
+    // Segmented caches return memory to the driver instead of lending individual VMM chunks. These hooks are
+    // installed after the serve prompt/verify plans exist, so each resize also updates the prompt's loan.
+    std::function<bool(int64_t)> kvg_segment_grow, kvg_segment_trim;
+    auto kvg_start = [&](int64_t top) -> bool {
+        kvg.on = strata::core::qsa_kv_elastic() && (xcache.vmm_range() != nullptr || xcache.segmented()) && d_res != nullptr &&
                  !host_res.empty() && srcp != nullptr && top > kvg.floor;
-        if (!kvg.on) return;
+        if (!kvg.on) {
+            // Never leave partially mapped pools without a coordinator: subsequent decode could write into an
+            // unmapped cell. A too-small cache or absent loan falls back to the full context or refuses startup.
+            return !strata::core::qsa_kv_elastic() ||
+                   strata::core::qsa_kv_elastic_grow(o.max_context, [] { return strata::core::VmmChunk(0); });
+        }
         kvg.top = kvg.lo = top;
         kvg.cells = strata::core::qsa_kv_elastic_cells();
         if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
@@ -5359,6 +5411,7 @@ int main(int argc, char** argv) {
                      (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
                      (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
                      (long long) top);
+        return true;
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
@@ -5366,8 +5419,9 @@ int main(int argc, char** argv) {
         if (!kvg.on || cells <= kvg.cells) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
-        if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
+        if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); kvg_report(); return true; }
         quiesce();
+        if (xcache.segmented()) return kvg_segment_grow && kvg_segment_grow(target);
         strata::core::VmmRange& r = *xcache.vmm_range();
         const uint64_t G = strata::core::vmm_granularity();
         std::vector<int32_t> owner;   // slot -> residency index
@@ -5462,6 +5516,7 @@ int main(int argc, char** argv) {
         if (!ok)
             std::fprintf(stderr, "strata: the K/V could not grow to %lld cells (%s)\n", (long long) target,
                          cudaGetErrorString(cudaGetLastError()));
+        if (ok) kvg_report();
         return ok;
     };
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
@@ -5469,6 +5524,7 @@ int main(int argc, char** argv) {
     auto kvg_trim = [&](int64_t cells) -> bool {
         if (!kvg.on) return true;
         const int64_t target = std::max<int64_t>(kvg.step, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        if (xcache.segmented()) return kvg_segment_trim && kvg_segment_trim(target);
         if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
         strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
         kvg.cells = strata::core::qsa_kv_elastic_cells();
@@ -5528,6 +5584,7 @@ int main(int argc, char** argv) {
         ++kvg.trims;
         std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
                              "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        kvg_report();
         return true;
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
@@ -6088,7 +6145,10 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        if (!kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots())) {
+            std::fprintf(stderr, "strata serve: the full K/V fallback does not fit\n");
+            return 1;
+        }
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -7663,7 +7723,7 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_ram_cache_mib=%lld conversation_ram_cache_slots=%d "
-                        "conversation_ram_cache_min_free_mib=%lld conversation_disk_mib=%lld conversation_disk_slots=%d tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_ram_cache_min_free_mib=%lld conversation_disk_mib=%lld conversation_disk_slots=%d tail_role_token=%lld vram_elastic=%d kv_grow=%d kv_cells=%lld kv_mapped_mib=%lld%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -7676,6 +7736,8 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_ram_cache_min_free_mib,
                         (long long) (conversation_disk_enabled ? o.conversation_disk_mib : 0),
                         conversation_disk_enabled ? o.conversation_disk_slots : 0, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        kvg.on ? 1 : 0, (long long) (kvg.on ? strata::core::qsa_kv_elastic_cells() : o.max_context),
+                        (long long) (strata::core::qsa_kv_elastic_mapped_bytes() >> 20),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -7753,6 +7815,113 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
+        // One residency/refill path for manual VRAM commands, temporary vision leases and elastic K/V.
+        // Evict before unmapping; publish refills only after their DMA has finished. FileExpertSource may return
+        // a reusable staging buffer in low-RAM mode, so a file-backed refill must finish before the next read.
+        auto cache_shrink = [&](int64_t keep, std::string& e) -> bool {
+            const int64_t seg = xcache.segment_bytes();
+            const int64_t live = xcache.slots_within((keep + seg - 1) / seg * seg);
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= live) {
+                    vram_evicted.emplace_back((int32_t) i, host_res[i]);
+                    host_res[i] = strata::core::kNotResident;
+                }
+            if (res_put(d_res) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                e = "the residency table upload failed before shrinking the cache";
+                return false;
+            }
+            if (!xcache.shrink(keep, e)) return false;
+            relend();
+            return true;
+        };
+        auto cache_grow = [&](int64_t target, std::string& e) -> bool {
+            if (!xcache.grow(target, e)) return false;
+            const int64_t live = xcache.slots();
+            std::vector<std::pair<int32_t, int32_t>> keep_out;
+            for (const auto& [i, slot] : vram_evicted) {
+                if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
+                const int64_t layer = i / g.n_expert;
+                int64_t pick = i;
+                if (host_res[(size_t) i] >= 0) {
+                    pick = -1;
+                    float best = -1.0f;
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t j = (size_t) (layer * g.n_expert + ex);
+                        if (host_res[j] >= 0) continue;
+                        const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
+                        if (u > best) { best = u; pick = (int64_t) j; }
+                    }
+                }
+                if (pick < 0) continue;
+                const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
+                if (b == nullptr || !xcache.fill_slot_queued(slot, b, e,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    e = "refilling the cache failed: " + e;
+                    return false;
+                }
+                if (srcp == &src && !src.resident_blob(layer, pick % g.n_expert) &&
+                    !xcache.sync_queued(e)) return false;
+                host_res[(size_t) pick] = slot;
+            }
+            if (!xcache.sync_queued(e) || res_put(d_res) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                if (e.empty()) e = "the cache refill or residency table upload failed";
+                return false;
+            }
+            vram_evicted.swap(keep_out);
+            relend();
+            return true;
+        };
+        auto cache_floor_bytes = [&]() -> int64_t {
+            const int64_t slots = std::min<int64_t>(xcache.full_slots(),
+                std::max<int64_t>(kvg.floor, 128 + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256))));
+            return xcache.bytes_of(slots);
+        };
+        // The combined startup allocation is the ceiling. KV growth takes cache segments first, preserving
+        // the existing free VRAM; a later short request returns those bytes. A manual VRAM command can lower it,
+        // whereas a vision lease never changes it. The last short segment may be smaller than segment_bytes().
+        int64_t kv_cache_budget = xcache.mapped_bytes() + (int64_t) strata::core::qsa_kv_elastic_mapped_bytes();
+        kvg_segment_grow = [&](int64_t target) -> bool {
+            if (vision_cache_bytes >= 0) return false;
+            const int64_t need = strata::core::qsa_kv_elastic_need(target);
+            const int64_t bytes = need * (int64_t) strata::core::vmm_granularity();
+            const int64_t before = xcache.slots();
+            const int64_t seg = xcache.segment_bytes();
+            const int64_t keep = std::max<int64_t>(cache_floor_bytes(),
+                std::max<int64_t>(0, xcache.mapped_bytes() - bytes) / seg * seg);
+            std::string e;
+            if (!cache_shrink(keep, e) ||
+                !strata::core::qsa_kv_elastic_grow(target, [] { return strata::core::VmmChunk(0); })) {
+                std::fprintf(stderr, "strata: elastic K/V grow failed: %s\n", e.c_str());
+                return false;
+            }
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+            ++kvg.grows;
+            std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); segmented expert cache %lld -> %lld slots\n",
+                         (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                         (long long) before, (long long) xcache.slots());
+            kvg_report();
+            return true;
+        };
+        kvg_segment_trim = [&](int64_t target) -> bool {
+            if (vision_cache_bytes >= 0) return false;
+            if (kvg.cells < target + 2 * kvg.step) return true;
+            const int64_t before = xcache.slots();
+            strata::core::qsa_kv_elastic_shrink(target, strata::core::vmm_chunk_free);
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+            const int64_t want = std::min<int64_t>(xcache.full_bytes(),
+                kv_cache_budget - (int64_t) strata::core::qsa_kv_elastic_mapped_bytes());
+            std::string e;
+            if (!cache_grow(want, e)) {
+                std::fprintf(stderr, "strata: elastic K/V cache restore failed: %s\n", e.c_str());
+                return false;
+            }
+            ++kvg.trims;
+            std::fprintf(stderr, "strata: K/V trimmed to %lld cells (%.2f GiB); segmented expert cache %lld -> %lld slots\n",
+                         (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                         (long long) before, (long long) xcache.slots());
+            kvg_report();
+            return true;
+        };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             const bool begin = cmd.rfind("VRAM BEGIN ", 0) == 0;
             const bool finish = cmd == "VRAM END";
@@ -7806,57 +7975,22 @@ int main(int argc, char** argv) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
-                if (!xcache.shrink(keep, e)) return false;
-                const int64_t live = xcache.slots();
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
-                        vram_evicted.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                    }
-                res_upload();
+                if (!cache_shrink(keep, e)) return false;
             } else if (!begin && mapped < (finish ? vision_cache_bytes : xcache.full_bytes())) {
                 std::string gerr;
                 const int64_t target = finish ? vision_cache_bytes : mapped + ((int64_t) free_b - want_free);
-                if (!xcache.grow(target, gerr)) {
+                if (!cache_grow(target, gerr)) {
                     if (finish) { e = "VRAM: restoring the vision lease failed: " + gerr; return false; }
-                    note = " (" + gerr + ")";
+                    // A partial mapping/refill must never be advertised as a healthy cache.
+                    e = "VRAM: restoring the cache failed: " + gerr;
+                    return false;
                 }
-                const int64_t live = xcache.slots();
-                std::string ferr;
-                std::vector<std::pair<int32_t, int32_t>> keep_out;
-                for (const auto& [i, slot] : vram_evicted) {
-                    if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
-                    const int64_t layer = i / g.n_expert;
-                    int64_t pick = i;
-                    if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
-                        pick = -1;
-                        float best = -1.0f;
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
-                            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
-                            if (u > best) { best = u; pick = (int64_t) j; }
-                        }
-                    }
-                    if (pick < 0) continue;
-                    const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
-                        e = "VRAM: refilling the cache failed: " + ferr;
-                        return false;
-                    }
-                    // Low-RAM file reads can return a reusable staging buffer. Complete this DMA before the
-                    // next blob() overwrites it. Resident arena pointers keep the normal batched refill.
-                    if (srcp == &src && !src.resident_blob(layer, pick % g.n_expert) &&
-                        !xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
-                    host_res[(size_t) pick] = slot;
-                }
-                vram_evicted.swap(keep_out);
-                if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
-                res_upload();
             }
             if (finish) vision_cache_bytes = -1;
-            if (!begin && !finish) cache_reserve_mib = reserve;
+            if (!begin && !finish) {
+                cache_reserve_mib = reserve;
+                kv_cache_budget = xcache.mapped_bytes() + (int64_t) strata::core::qsa_kv_elastic_mapped_bytes();
+            }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
@@ -7870,6 +8004,7 @@ int main(int argc, char** argv) {
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                         (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) before);
+            kvg_report();
             return true;
         };
         // ---- --batch: the slots of the batch windows
@@ -10807,6 +10942,15 @@ int main(int argc, char** argv) {
                                      "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
                              src.gguf_mode() ? " (the GGUF in place)" : "");
+            if (srcp == &src && src.stage_keep() > 0)
+                std::fprintf(stderr, "strata serve: RAM tier LRU (%.2f GiB%s): since the start %lld decode and %lld prompt "
+                                     "blobs found in it\n", (double) src.stage_keep() / 1073741824.0,
+                             src.unbuffered() ? "" : ", inactive: the reads go through the file cache",
+                             (long long) src.staged_decode_hits(), (long long) src.staged_prompt_hits());
+            if (srcp == &src && src.lru_freed() > 0)
+                std::fprintf(stderr, "strata serve: RAM tier LRU elastic: %.2f GiB held now, %lld blobs given back to other "
+                                     "programs since the start\n", (double) src.lru_live_bytes() / 1073741824.0,
+                             (long long) src.lru_freed());
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
@@ -10893,7 +11037,7 @@ int main(int argc, char** argv) {
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
-                kvg_start(first);
+                if (!kvg_start(first)) return 1;
                 if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
@@ -10931,7 +11075,7 @@ int main(int argc, char** argv) {
         }
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
-            kvg_start(xcache.slots());
+            if (!kvg_start(xcache.slots())) return 1;
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
@@ -10981,7 +11125,7 @@ int main(int argc, char** argv) {
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
-        kvg_start(xcache.slots());
+        if (!kvg_start(xcache.slots())) return 1;
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {

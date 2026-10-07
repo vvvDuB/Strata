@@ -8,7 +8,7 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.40 LANGUAGES CXX)
+project(strata VERSION 0.1.42 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -488,10 +488,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+    add_test(NAME file_expert_lru_elastic_test COMMAND file_expert_source_test --lru-elastic)
+    set_tests_properties(file_expert_lru_elastic_test PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
     add_executable(vmm_test tests/core/vmm_test.cpp)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    add_executable(kv_vram_elastic_test tests/core/kv_vram_elastic_test.cpp)
+    target_link_libraries(kv_vram_elastic_test PRIVATE strata_engine)
+    add_test(NAME kv_vram_elastic_test COMMAND kv_vram_elastic_test)
+    set_tests_properties(kv_vram_elastic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   endif()
   add_executable(local_file_expert_source_test EXCLUDE_FROM_ALL tests/file_expert_source_test.cpp)
   target_link_libraries(local_file_expert_source_test PRIVATE strata_engine)

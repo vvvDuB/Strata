@@ -655,9 +655,7 @@ class StrataEngine:
         self.max_context = 0
         for line in self.proc.stdout:
             if line.startswith("INFO "):
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+                self._update_info(line)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -718,11 +716,25 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _update_info(self, line):
+        """Publish one complete native facts snapshot, including updates while a request is running."""
+        facts = {}
+        for field in line.split()[1:]:
+            key, sep, value = field.partition("=")
+            if sep and key:
+                facts[key] = int(value) if value.lstrip("-").isdigit() else value
+        self.info = {**self.info, **facts}
+        return facts
+
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            if line.startswith("INFO "):
+                if self.proc is proc:
+                    self._update_info(line)
+                continue                        # telemetry never competes with request/control replies
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -898,11 +910,7 @@ class StrataEngine:
             if line.startswith("ERR"):
                 raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
             if line.startswith("VRAM "):
-                out = {}
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    out[k] = int(v) if v.lstrip("-").isdigit() else v
-                self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
+                out = self._update_info(line)
                 self.info["vram"] = out
                 return out
             if time.time() > deadline:

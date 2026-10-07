@@ -53,6 +53,7 @@ class EngineCommand(unittest.TestCase):
         self.assertEqual(out["expert_slots"], 1200)
         self.assertEqual(out["prompt_chunk"], 2048)
         self.assertEqual(e.info["expert_slots"], 1200)
+        self.assertEqual(e.info["expert_cache_mib"], 1536)
         e = self.engine(["VRAM reserve_mib=700 expert_slots=3700\n"])
         e.vram(None)
         self.assertEqual(e.proc.stdin.getvalue(), "VRAM\n")

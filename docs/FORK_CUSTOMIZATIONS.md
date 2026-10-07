@@ -7,6 +7,14 @@ encoder, disk-cached SVE1 embeddings and temporary GPU expert-cache leases,
 including the resident low-RAM complement. Existing resident vision remains
 the default; no additional permanent encoder VRAM reserve is required.
 
+[Elastic KV with a segmented expert cache](KV_GROW_VRAM_ELASTIC.md) supports
+`--kv-grow --vram-elastic`, NVFP4 and the resident low-RAM complement. KV
+growth and on-demand vision share the cache resize and refill operations.
+
+[Linux expert read batches](LINUX_STAGER_BATCH.md) groups the prefill stager's
+file reads on the existing O_DIRECT/AIO path, preserving mapped fallback and
+RAM/GPU exchange rotations.
+
 # Fork customizations and upstream integration
 
 This fork retains the local inference/serving changes made on Strata 0.1.20
@@ -137,3 +145,11 @@ its meaning; RAM parking uses `--conversation-ram-cache-*`. Checkpoint payload
 identity is now v2 (five buffers, including indexer accumulator and position),
 so use a fresh cache namespace for validation. Earlier live-model results above
 belong to the previous build and are not validation of this integration.
+
+## RAM expert LRU
+
+[RAM_TIER_LRU.md](RAM_TIER_LRU.md) documents the #1324 port, its Linux page
+allocation and synchronized statistics, and the fixed 18 + 4 GiB expert budget
+selected by the owner launcher. The elastic watcher and optional tier trace are
+available; elasticity is not enabled in that launcher. Linux unit and real-model
+checks are recorded separately from the upstream Windows performance numbers.

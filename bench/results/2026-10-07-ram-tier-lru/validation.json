@@ -1,0 +1,96 @@
+{
+  "date": "2026-10-07T16:47:00+02:00",
+  "source_pr": "https://github.com/Niko1221/Strata/pull/1324",
+  "source_pr_head": "20e55bc454d33b408f1f3a2c12b72aed5e66e45d",
+  "native_sha256": "bf3302e66e4f33e36d6769bafca62a35eacd0c1e98b471601100635651a25cee",
+  "source_fingerprint": "313887f9de656927",
+  "build": "Release CUDA SM120; native GGUF IQ3_XXS; NVFP4 KV",
+  "tests": {
+    "ctest": {
+      "file_expert_source_test": "pass",
+      "file_expert_lru_elastic_test": "pass (2.67 s, concurrent copies, Linux RSS release and regrowth)",
+      "vmm_test": "pass",
+      "kv_vram_elastic_test": "pass"
+    },
+    "rotation_variants": [
+      "copy+pinned: exact bytes pass",
+      "rotate+pinned: exact bytes pass",
+      "rotate+pageable fallback: exact bytes pass"
+    ],
+    "server_unit_tests": {
+      "count": 27,
+      "result": "pass",
+      "modules": [
+        "serve.test_vram",
+        "serve.test_runtime_info",
+        "serve.test_vision_on_demand"
+      ],
+      "python": "project .venv"
+    },
+    "cli_checks": {
+      "count": 8,
+      "result": "pass"
+    },
+    "runtime_smoke": {
+      "count": 5,
+      "arithmetic": "4 before and after vision",
+      "image": "red image identified",
+      "text_requests": [
+        {
+          "output_tokens": 256,
+          "decode_tok_s": 35.7
+        },
+        {
+          "output_tokens": 256,
+          "decode_tok_s": 40.0
+        }
+      ],
+      "cumulative_decode_lru_hits": 23313,
+      "note": "Successive warmed functional requests, not an A/B speedup measurement"
+    },
+    "optional_environment_modes": {
+      "stage_keep_mib": 8,
+      "trace_rows": 173,
+      "trace_kinds": {
+        "f": 166,
+        "r": 7
+      },
+      "result": "file source checks pass with env retention and trace enabled; valid five-column records"
+    }
+  },
+  "active_service": {
+    "name": "qwen3.8-flash-next",
+    "parent_pid": 3904937,
+    "native_pid": 3904941,
+    "native_flags": {
+      "--resident-budget-gib": "22",
+      "--resident-lru-gib": "4",
+      "--kv": "nvfp4",
+      "--max-context": "131072"
+    },
+    "native_exe_sha256_matches_installed": true,
+    "fixed_profile_mib": 18431,
+    "expert_slots_after_vision": 3354,
+    "elastic_enabled": false,
+    "native_rss_gib": 26.012,
+    "ram_available_gib": 3.738
+  },
+  "port_changes": [
+    "Linux stage pages use mmap/munmap for immediate reclamation",
+    "live-byte statistic uses stage mutex",
+    "LRU counters reset when source closes",
+    "invalid LRU sizes/budgets rejected before loading"
+  ],
+  "existing_features_preserved": [
+    "NVFP4",
+    "KV growth and VRAM elasticity",
+    "on-demand vision",
+    "Linux batched expert reads",
+    "resident exchange rotation"
+  ],
+  "limitations": [
+    "No A/B throughput comparison with previous binary",
+    "Underlying NVMe latency spike cause remains undiagnosed",
+    "Elastic mode tested synthetically and available, but production uses fixed LRU"
+  ]
+}

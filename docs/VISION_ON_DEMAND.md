@@ -28,6 +28,11 @@ After the separator, enable the existing image protocol and segmented cache:
 --vision --vram-elastic --vram-segment-mib 64
 ```
 
+The segmented cache also supports [elastic KV](KV_GROW_VRAM_ELASTIC.md) with
+`--kv-grow`, including NVFP4 and the resident low-RAM complement. A vision
+lease restores the cache size preceding the encoder, accounting for the KV
+already mapped by a long conversation.
+
 No permanent encoder reserve is added. `--vision-vram-mib` sets the free VRAM
 required temporarily by the encoder (default 2048 MiB); it does not change
 `--vram-reserve-mib`. Choose it for the projector, backend and image token cap.

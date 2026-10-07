@@ -415,6 +415,9 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
     int dev = 0;
     cudaGetDevice(&dev);
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    // The reservation includes granularity padding. Asking for the full logical arena must also restore the
+    // final (possibly short) physical segment, otherwise the last expert slot can never return after a shrink.
+    if (want_bytes >= full_bytes()) want_bytes = (int64_t) reserved_;
     int64_t at = mapped_bytes();
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;

@@ -1,0 +1,49 @@
+{
+  "system": "Linux-6.12.111+deb13-amd64-x86_64-with-glibc2.41",
+  "cpu_physical": 8,
+  "cpu_logical": 16,
+  "ram_bytes": 33575215104,
+  "git_head": "dd9d6dc810fe22bd44ed6b3c7293396945c6e459",
+  "build_metadata": {
+    "source": "local",
+    "version": "0.1.40",
+    "upstream_version": "0.1.40.1",
+    "commit": "dd9d6dc810fe22bd44ed6b3c7293396945c6e459",
+    "archs": [
+      120
+    ],
+    "vision": "gpu",
+    "cuda_dirs": [
+      "/usr/local/cuda-13.4/bin",
+      "/usr/local/cuda-13.4/lib64"
+    ],
+    "src": "313887f9de656927",
+    "vision_src": "8164391db296f39f",
+    "sha256": "bf3302e66e4f33e36d6769bafca62a35eacd0c1e98b471601100635651a25cee",
+    "vision_mode": "on-demand",
+    "vision_sha256": "1983f9955e5c76bc116ba95c4f9d162b6f1ba135a38fc89d5d3e24cdf9d54bfd",
+    "worktree_dirty": true,
+    "local_features": [
+      "vision-on-demand",
+      "kv-grow-vram-elastic",
+      "live-cache-monitor",
+      "linux-stager-batch",
+      "ram-tier-lru",
+      "linux-elastic-lru"
+    ],
+    "base_release": "v0.1.40.1-nvfp4.2",
+    "ram_tier_lru": {
+      "upstream_pr": 1324,
+      "upstream_head": "20e55bc454d33b408f1f3a2c12b72aed5e66e45d",
+      "budget_gib": 22,
+      "lru_gib": 4,
+      "elastic_enabled_in_launcher": false,
+      "linux_stage_allocator": "mmap/munmap",
+      "statistics_synchronized": true
+    }
+  },
+  "cpu_model": "AMD Ryzen 7 5700X3D 8-Core Processor",
+  "nvme_model": "Predator SSD GM7 2TB",
+  "nvme_firmware": "SN25043",
+  "gpu": "NVIDIA GeForce RTX 5070, 12227 MiB, 615.71.09"
+}
