@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 namespace strata::core {
 namespace {
@@ -31,8 +32,8 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: NVFP4 requires resident RHT256 and distinct format flags";
         return false;
     }
-    if (st.kv_hybrid && (st.kv_mode != 0 || st.kv_q4 || st.kv_int8)) {
-        error = "conversation snapshot: hybrid K8V4 requires an identity layout and distinct format flags";
+    if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
+        error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
         return false;
     }
     const auto s = strata::kernels::qsa_real_shapes();
@@ -78,7 +79,9 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     const bool host = st.kv_mode != 0 && !resident;
     if (st.kv_nvfp4) return {st.k_nvfp4, st.v_nvfp4, nullptr, nullptr, st.idx_pooled};
-    if (st.kv_hybrid) return {st.k_q, st.v_q4, st.k_scale, nullptr, st.idx_pooled};
+    if (st.kv_hybrid)
+        return {host ? st.host.k_q : st.k_q, host ? st.host.v_q4 : st.v_q4, host ? st.host.k_scale : st.k_scale,
+                nullptr, st.idx_pooled};
     if (st.kv_q4)
         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
     if (st.kv_int8)
@@ -231,6 +234,34 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
     return false;
+}
+
+bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                std::array<uint64_t, 5>& sizes, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    return true;
+}
+
+bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
+                            int64_t upto, bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvSource s;
+    s.format = l.format; s.cells = l.cells; s.heads = g.n_head_kv; s.head_dim = g.head_dim;
+    s.page_size = l.page_size; s.pooled_rows = l.pooled_rows; s.idx_dim = g.idx_key_dim;
+    s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto src = pools(st);
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
+        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+    };
+    s.error = [why] { return *why; };
+    out = std::move(s);
+    return true;
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,

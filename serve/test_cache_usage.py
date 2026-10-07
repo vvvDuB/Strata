@@ -50,6 +50,22 @@ class CacheUsage(unittest.TestCase):
                 self.assertEqual(usage["input_tokens"], 23 if cached else 30)
 
 class CacheProtocol(unittest.TestCase):
+    def test_upstream_tiers_and_fork_diagnostics_coexist(self):
+        e = StrataEngine.__new__(StrataEngine)
+        e._parse_done("DONE 8 42617 12.5 33.0 stop 4 7 14336 12 20 90 3 1.5 28281 2"
+                      " common_prefix_tokens=16046 replay_gap_tokens=1710 cache_source=checkpoint"
+                      " cache_restore_ms=2.75 prefill_replay_ms=8.0")
+        self.assertEqual(e.last["reused"], 14336)
+        self.assertEqual(e.last["ram_blobs"], 90)
+        self.assertEqual(e.last["file_blobs"], 3)
+        self.assertEqual(e.last["file_mb"], 1.5)
+        self.assertEqual(e.last["prompt_read"], 28281)
+        self.assertEqual(e.last["offloaded"], 2)
+        self.assertEqual(e.last["common_prefix_tokens"], 16046)
+        self.assertEqual(e.last["replay_gap_tokens"], 1710)
+        self.assertEqual(e.last["cache_source"], "checkpoint")
+        self.assertEqual(e.last["cache_timings"], {"snapshot_restore_ms": 2.75, "prefill_replay_ms": 8.0})
+
     def test_new_done_preserves_coverage_diagnostics(self):
         e = StrataEngine.__new__(StrataEngine)
         e._parse_done("DONE 8 42617 12.5 33.0 stop 4 7 14336 12 20 16046 1710 checkpoint")
@@ -68,7 +84,7 @@ class CacheProtocol(unittest.TestCase):
     def test_request_error_clears_old_usage(self):
         e = StrataEngine.__new__(StrataEngine)
         e.last = {"reused": 12345, "replay_gap_tokens": 2048}
-        e.proc = SimpleNamespace(stdin=io.StringIO())
+        e.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
         e.lines = queue.Queue()
         e.lines.put("ERR invalid diagnostic request")
         with self.assertRaisesRegex(ValueError, "invalid diagnostic request"):
@@ -81,7 +97,7 @@ class CacheProtocol(unittest.TestCase):
                 raise BrokenPipeError("closed")
         e = StrataEngine.__new__(StrataEngine)
         e.last = {"reused": 12345}
-        e.proc = SimpleNamespace(stdin=DeadInput())
+        e.proc = SimpleNamespace(stdin=DeadInput(), poll=lambda: None)
         e.exit_code = lambda: -9
         with self.assertRaises(EngineDied):
             list(e.generate([1, 2], 8, {}, threading.Event()))

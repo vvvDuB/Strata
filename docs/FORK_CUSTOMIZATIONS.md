@@ -1,6 +1,6 @@
-# Current integration: 0.1.31
+# Current integration: 0.1.40.1
 
-The owner fork now integrates official `v0.1.31` (`9259cad4cfa3543cd3b8decab5962672b968c649`) on top of the V6/writeback baseline. See [UPSTREAM_0_1_31.md](UPSTREAM_0_1_31.md) for the current integration contract and validation. The older sections below are historical.
+The owner fork integrates official `v0.1.40.1` (`82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`), retaining the owner cache, cancellation, direct server CLI, AVX2 and NVFP4 changes. See [UPSTREAM_0_1_40_1.md](UPSTREAM_0_1_40_1.md) for the current integration and validation. The older sections below are historical.
 
 # Fork customizations and upstream integration
 

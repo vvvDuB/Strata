@@ -19,7 +19,7 @@ class Nvfp4Setup(unittest.TestCase):
         if build:
             argv += ['--build']
         return install(ram, found, argv, extra=[mock.patch.object(setup, 'build_engine',
-                       side_effect=lambda *a: setup.ROOT / 'engine')])
+                       side_effect=lambda *a, **k: setup.ROOT / 'engine')])
 
     def test_main_and_drafter_memory(self):
         self.assertEqual(setup.kv_budget_bytes_per_token('nvfp4'), 8160)

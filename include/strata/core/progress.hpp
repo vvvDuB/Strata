@@ -3,8 +3,8 @@
 // The engine's host loop and the GPU wait on each other through flags; a protocol bug there does not crash, it
 // spins forever (the GPU "100%", one CPU core busy, no tokens).  `--serve` runs a watchdog thread over this: a
 // request whose heartbeat stops for `STRATA_WATCHDOG_S` seconds (default 60; 0 = off) ends the engine with the
-// stage it was stuck in, and the server starts it again instead of hanging.  Tokens, prompt chunks and verify
-// windows beat; the stage is two relaxed stores per layer, which the token path does not notice.
+// stage it was stuck in, and the server starts it again instead of hanging. Tokens, prompt chunks, verify
+// windows and completed expert layers beat; changing the diagnostic stage alone is not progress.
 #pragma once
 
 #include <atomic>
@@ -22,6 +22,9 @@ struct Progress {
     std::atomic<int64_t> chunk{-1};      ///< #251: the prompt chunk (its first position) a batched-read stage is in
     std::atomic<int64_t> since_ms{0};    ///< when `where` was set (steady clock): how long a stage has lasted
     std::atomic<uint64_t> ticks{0};      ///< layers served: a window that still moves, slowly, against one that stopped
+    /// a step that blocks in one call (a file flush, a host->device transfer of a whole session) is given until this
+    /// time (steady ms; 0 = none) instead of the watchdog's limit - an explicit, bounded allowance, not a beat
+    std::atomic<int64_t> allow_until_ms{0};
 };
 
 inline int64_t progress_now_ms() {
@@ -39,6 +42,8 @@ inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{null
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_gpu_fn().load()) fn(f);
 }
+/// --pipeline-windows: the pipelined loop's windows and the drafter's chain (set while that loop runs)
+inline std::atomic<DiagFn>& diag_pipeline_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 
 inline Progress& progress() {
     static Progress p;
@@ -54,6 +59,17 @@ inline void progress_at(const char* where, int64_t detail = -1, int64_t chunk = 
 }
 
 inline void progress_beat() { progress().beats.fetch_add(1, std::memory_order_relaxed); }
-inline void progress_tick() { progress().ticks.fetch_add(1, std::memory_order_relaxed); }
+inline void progress_tick() {
+    progress().ticks.fetch_add(1, std::memory_order_relaxed);
+    // A long window can still finish expert layers while exceeding the token/window heartbeat limit.
+    // Only completed work renews it: a host spinning on an unchanged GPU flag must still time out.
+    progress_beat();
+}
+/// A beat that also sets (seconds > 0) or clears (0) the allowance of a blocking step: the watchdog does not fire
+/// before the allowance ends, and fires at its end if nothing beat since.
+inline void progress_allow(int64_t seconds) {
+    progress().allow_until_ms.store(seconds > 0 ? progress_now_ms() + seconds * 1000 : 0, std::memory_order_relaxed);
+    progress_beat();
+}
 
 }  // namespace strata::core

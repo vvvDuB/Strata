@@ -32,10 +32,7 @@ jobs:
           cmake -S . -B build-cache-host -DCMAKE_BUILD_TYPE=Debug -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF \
             -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_BUILD_TESTS=OFF \
             -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_ENABLE_CONVERSATION_DISK=ON
-          cmake --build build-cache-host -j2 --target conversation_cache_test conversation_memory_test \
-            conversation_file_test shared_conversation_store_test conversation_io_cancel_test \
-            checkpoint_records_test checkpoint_staging_test conv_cache_test conv_cache_policy_test \
-            request_stop_test prefix_file_test conversation_store_test
+          cmake --build build-cache-host -j2
           ctest --test-dir build-cache-host --output-on-failure
       - name: Serving and replay contracts
         run: |

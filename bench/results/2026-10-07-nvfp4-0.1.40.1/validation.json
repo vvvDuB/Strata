@@ -1,0 +1,196 @@
+{
+  "date": "2026-10-07",
+  "upstream_tag": "v0.1.40.1",
+  "upstream_commit": "82f46a8c8f475f001ad76d92f58f4a4f8ffb0253",
+  "fork_tag": "v0.1.40.1-nvfp4.1",
+  "engine_version": "0.1.40",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 5700X3D (AVX2; no AVX-512)",
+    "gpu": "NVIDIA RTX 5070 12 GiB, SM120",
+    "physical_ram_gib": 32,
+    "cuda": "13.4.92",
+    "driver": "615"
+  },
+  "native_ctest": {
+    "attempted": 120,
+    "returned_success": 117,
+    "failed": 3,
+    "failures": {
+      "ple_parity": "Unpublished PLE oracle fixtures/model/canonical pack absent",
+      "platform_memory_test": "Default RLIMIT_MEMLOCK=8 MiB; passed owner-supplied sudo prlimit retest at 512 MiB limit",
+      "expert_multi_test": "Requires AVX-512/VNNI absent on the validation CPU"
+    },
+    "internal_hardware_skips": [
+      "expert_parity AVX-512 portion",
+      "pool_test AVX-512 portion",
+      "pool_stress",
+      "high-CPU affinity path (no allowed CPU ID >=64)"
+    ]
+  },
+  "python_tools": {
+    "tests": 509,
+    "skipped": 4,
+    "result": "OK",
+    "optimized_result": "OK",
+    "skips": [
+      "3 opt-in live Coder model regressions (the installed model is IQ3_XXS Flash-Next)",
+      "1 Windows CPUID stub test"
+    ]
+  },
+  "python_request_capture": {
+    "tests": 1,
+    "result": "OK"
+  },
+  "host_ci": {
+    "tests": 26,
+    "result": "OK"
+  },
+  "host_asan_ubsan": {
+    "tests": 16,
+    "result": "OK"
+  },
+  "nvfp4_gpu": {
+    "attention_checks": 7097073,
+    "fixtures": 22,
+    "unpack_checks": 662144,
+    "sanitizer_combinations": 16,
+    "errors": 0,
+    "race_hazards": 0,
+    "elastic_pool_lifecycle": "PASS"
+  },
+  "native_ple_batch": {
+    "sizes": [
+      1,
+      2,
+      8,
+      9,
+      10,
+      64,
+      65,
+      77,
+      256,
+      1024
+    ],
+    "maximum_absolute_error": 0,
+    "cuda_memcheck_size": 1024,
+    "cuda_memcheck_errors": 0
+  },
+  "mmap_expert_source": "PASS",
+  "real_nvfp4_mtp_requests": [
+    {
+      "name": "short",
+      "elapsed_seconds": 1.415,
+      "prompt_tokens": 29,
+      "cached_tokens": 0,
+      "output": "4"
+    },
+    {
+      "name": "repeat",
+      "elapsed_seconds": 0.747,
+      "prompt_tokens": 29,
+      "cached_tokens": 22,
+      "output": "4"
+    },
+    {
+      "name": "long",
+      "elapsed_seconds": 10.627,
+      "prompt_tokens": 9928,
+      "cached_tokens": 0,
+      "output": "COMPLETATO"
+    },
+    {
+      "name": "fork",
+      "elapsed_seconds": 3.154,
+      "prompt_tokens": 9927,
+      "cached_tokens": 8192,
+      "output": "42"
+    },
+    {
+      "name": "restore",
+      "elapsed_seconds": 1.044,
+      "prompt_tokens": 29,
+      "cached_tokens": 3,
+      "output": "4"
+    },
+    {
+      "name": "long-67k",
+      "elapsed_seconds": 52.796,
+      "prompt_tokens": 67128,
+      "cached_tokens": 0,
+      "output": "COMPLETATO"
+    },
+    {
+      "name": "fork-67k",
+      "elapsed_seconds": 3.396,
+      "prompt_tokens": 67127,
+      "cached_tokens": 65536,
+      "output": "42"
+    },
+    {
+      "name": "ram-A",
+      "elapsed_seconds": 12.54,
+      "prompt_tokens": 9926,
+      "cached_tokens": 0,
+      "output": "42"
+    },
+    {
+      "name": "ram-B",
+      "elapsed_seconds": 84.172,
+      "prompt_tokens": 11726,
+      "cached_tokens": 0,
+      "output": "42"
+    },
+    {
+      "name": "ram-A-restore",
+      "elapsed_seconds": 22.262,
+      "prompt_tokens": 9926,
+      "cached_tokens": 9919,
+      "output": "42"
+    }
+  ],
+  "real_protocols": [
+    "streaming disconnect/cancel",
+    "post-cancel generation",
+    "Anthropic Messages",
+    "OpenAI Responses"
+  ],
+  "long_profile": {
+    "context_capacity": 131072,
+    "maximum_tested_input": 67128,
+    "vram_reserve_mib": 640,
+    "resident_expert_budget_gib": 22,
+    "loaded_vram_free_mib": 223
+  },
+  "ram_cache_profile": {
+    "resident_expert_budget_gib": 16,
+    "ram_cache_budget_mib": 8192,
+    "slots": 2,
+    "physical_ram_floor_mib": 4096
+  },
+  "watchdog": {
+    "timeout_seconds": 60,
+    "before_fix": "67k trial aborted despite completed expert layers advancing; host diagnostic at layer29 then48",
+    "change": "Completed expert layers renew heartbeat; stage changes alone do not"
+  },
+  "unvalidated": [
+    "Full 128k-token input",
+    "Full-model logit parity",
+    "HIP",
+    "SYCL",
+    "Multi-GPU runtime",
+    "AVX-512 expert kernels",
+    "Original independent PLE oracle"
+  ],
+  "engine_sha256": "b936511008510fb2d317bf268a3ec15e713bed9a59c71f64154e35bd15899e27",
+  "python_server": {
+    "tests": 498,
+    "skipped": 3,
+    "result": "OK",
+    "skips": [
+      "Windows job objects (2)",
+      "Windows power throttling (1)"
+    ],
+    "real_tokenizer": true,
+    "jsonschema": true
+  }
+}
