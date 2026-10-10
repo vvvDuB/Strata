@@ -570,6 +570,24 @@ print(r.choices[0].message.content)
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **Pi checkpoints.** The Python server automatically recognizes Pi 1.0/1.1's standalone
+  context-summary system message with one serialized conversation and no tools,
+  including the separate summary of an unfinished turn's prefix.
+  These requests answer without thinking and receive a short-checkpoint instruction (target 1,200-1,800 tokens):
+  keep current goals, constraints, identifiers, evidence and next actions; condense old investigations and merge
+  duplicate facts. Guidance is appended to the system message and after the full original user request. Ordinary
+  agent turns and other summarization requests keep their requested thinking. The source
+  conversation and client output limit are retained; the target is an instruction, not a guarantee. A reply that
+  hits its limit still reports `"length"`, so Pi can reject an incomplete checkpoint. No Pi extension or
+  configuration flag is needed, and detection adds no console messages.
+  For compatibility, requests may also use `"thinking_budget_tokens": N` for the hard thinking budget above;
+  `reasoning_budget_tokens` takes precedence when both are present. Strata's existing `0` = no budget convention
+  applies to both names (use `reasoning_effort: "none"` to disable thinking).
+- **Retrying an interrupted engine.** A streamed engine failure reports `Service unavailable` together with the
+  original cause and the restart instruction. Once SSE headers have been sent the HTTP status is already 200;
+  this wording keeps the failure recognizable as transient to clients such as Pi when the SDK exposes only the
+  message. A retry starts the engine again. Invalid requests and incomplete length-limited replies remain errors
+  of their own. Pi's retry settings determine the number of attempts and their backoff.
 - **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
