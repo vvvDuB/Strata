@@ -19,6 +19,16 @@ inline cudaError_t cudaMemcpy(void* dst,const void* src,size_t n,cudaMemcpyKind)
     return cudaSuccess;
 }
 inline cudaError_t cudaDeviceSynchronize() {return cudaSuccess;}
+inline constexpr unsigned cudaStreamNonBlocking = 1;
+inline cudaError_t cudaGetDevice(int* device) {*device=0;return cudaSuccess;}
+inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* stream,unsigned) {
+    static int marker;
+    *stream=&marker;
+    return cudaSuccess;
+}
+inline cudaError_t cudaMemcpyAsync(void* dst,const void* src,size_t n,cudaMemcpyKind kind,cudaStream_t) {
+    return cudaMemcpy(dst,src,n,kind);
+}
 inline cudaError_t cudaStreamSynchronize(cudaStream_t) {return cudaSuccess;}
 inline cudaError_t cudaGetLastError() {return cudaSuccess;}
 inline const char* cudaGetErrorString(cudaError_t e) {return e==cudaSuccess?"success":"test transfer failure";}

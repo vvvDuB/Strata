@@ -1,7 +1,6 @@
-# Current integration: 0.1.40.1
+# Current integration: 0.1.42
 
-The owner fork integrates official `v0.1.40.1` (`82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`), retaining the owner cache, cancellation, direct server CLI, AVX2 and NVFP4 changes. See [UPSTREAM_0_1_40_1.md](UPSTREAM_0_1_40_1.md) for the current integration and validation. The older sections below are historical.
-
+The owner fork integrates official `v0.1.42` (`61b3fb5dd3f1e8ec09cf7e4e05208bc6d3c46406`), retaining NVFP4 KV, elastic GPU and RAM caches, exact checkpoints, on-demand vision, automatic Pi compaction, cancellation and the direct server CLI. See [UPSTREAM_0_1_42.md](UPSTREAM_0_1_42.md) for integration decisions and validation. The older sections below are historical.
 The fork also supports [vision on demand](VISION_ON_DEMAND.md): an ephemeral
 encoder, disk-cached SVE1 embeddings and temporary GPU expert-cache leases,
 including the resident low-RAM complement. Existing resident vision remains
