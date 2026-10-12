@@ -169,6 +169,36 @@ class MemoryLease(unittest.TestCase):
 
 
 class BatchExclusion(unittest.TestCase):
+    def test_cancelled_image_wait_releases_admission_without_encoding(self):
+        from serve.server import ClientGone
+        tok = ByteTokenizer()
+        encoded, cancel = threading.Event(), threading.Event()
+        vision = SimpleNamespace(on_demand=True, gpu=False, encode=lambda src: encoded.set())
+        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=vision)
+        errors = []
+        def image():
+            try:
+                svc._encode_images([b"image"], cancel)
+            except BaseException as e:
+                errors.append(e)
+        with svc.vision_gate.shared(threading.Event()) as admitted:
+            self.assertTrue(admitted)
+            thread = threading.Thread(target=image)
+            thread.start()
+            deadline = time.monotonic() + 3
+            while not svc.vision_gate.writers and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(svc.vision_gate.writers, 1)
+            cancel.set()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ClientGone)
+            self.assertFalse(encoded.is_set())
+            self.assertEqual(svc.vision_gate.writers, 0)
+        self.assertTrue(svc.fifo.acquire(blocking=False))
+        svc.fifo.release()
+
     def test_service_batch_generation_holds_shared_lease_until_it_finishes(self):
         tok = ByteTokenizer()
         active = threading.Barrier(3)

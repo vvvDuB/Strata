@@ -4,6 +4,7 @@
 #pragma once
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 using cudaStream_t = void*;
 using cudaGraphExec_t = void*;
 using cudaGraph_t = void*;
@@ -32,3 +33,14 @@ inline cudaError_t cudaMemcpyAsync(void* dst,const void* src,size_t n,cudaMemcpy
 inline cudaError_t cudaStreamSynchronize(cudaStream_t) {return cudaSuccess;}
 inline cudaError_t cudaGetLastError() {return cudaSuccess;}
 inline const char* cudaGetErrorString(cudaError_t e) {return e==cudaSuccess?"success":"test transfer failure";}
+
+// PinnedRing is included by the upstream prefill interface. This host fixture
+// must never exercise pinned allocation or event ordering: abort if it does.
+inline constexpr unsigned cudaHostAllocPortable = 1;
+inline constexpr unsigned cudaEventDisableTiming = 2;
+inline cudaError_t cudaHostAlloc(void**, size_t, unsigned) { std::abort(); }
+inline cudaError_t cudaFreeHost(void*) { std::abort(); }
+inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t*, unsigned) { std::abort(); }
+inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { std::abort(); }
+inline cudaError_t cudaEventSynchronize(cudaEvent_t) { std::abort(); }
+inline cudaError_t cudaEventDestroy(cudaEvent_t) { std::abort(); }

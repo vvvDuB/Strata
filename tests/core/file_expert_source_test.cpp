@@ -5,6 +5,7 @@
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "ggml.h"
+#include "gguf.h"
 #endif
 
 #include <cuda_runtime.h>
@@ -385,6 +386,18 @@ void test_pin_pacing() {
     require(meminfo_bytes(info, "MemFree") == 1284096ull * 1024, "MemFree was misread");
     require(meminfo_bytes(info, "MemAvailable") == 33463296ull * 1024, "MemAvailable was misread");
     require(meminfo_bytes(info, "Mem") == 0 && meminfo_bytes(info, "Shmem") == 0, "an absent key was not 0");
+    // 0.1.42 (dual-socket report): node 1 full of another model's cache, node 0 empty of it
+    require(numa_pin_free(100 * GiB, {}) == 100 * GiB && numa_pin_free(100 * GiB, {100 * GiB}) == 100 * GiB,
+            "a single-node host's figure changed");
+    require(numa_pin_free(90 * GiB, {88 * GiB, 2 * GiB}) == 4 * GiB, "an emptied node did not lower the figure");
+    require(numa_pin_free(40 * GiB, {20 * GiB, 20 * GiB}) == 40 * GiB, "balanced nodes changed the figure");
+    require(numa_pin_free(10 * GiB, {50 * GiB, 50 * GiB}) == 10 * GiB, "the total must still bound it");
+    require(pin_depends_on_reclaim(numa_pin_free(90 * GiB, {88 * GiB, 2 * GiB}), 26 * GiB, 4 * GiB),
+            "an unbalanced two-node host was not paced");
+    require(page_cache_hint(info).find("drop_caches") != std::string::npos &&
+            page_cache_hint(info).find("STRATA_DROP_CACHE_ON_EXIT") != std::string::npos &&
+            page_cache_hint(info).find("52.0 GiB") != std::string::npos, "the cache hint is incomplete");
+    require(page_cache_hint("MemFree: 100 kB\nCached: 1000 kB\n").empty(), "a small cache was reported");
 }
 
 void test_resident_memory_budget() {
@@ -457,6 +470,60 @@ void set_env(const char* name, const char* value) {
 #else
     if (value != nullptr) setenv(name, value, 1);
     else unsetenv(name);
+#endif
+}
+
+// The recheck after the resident copy must retain the same private-LRU policy as startup.
+// A sparse pack larger than available RAM distinguishes that rule from Linux's partial file cache;
+// no expert pages or resident buffers are allocated for this test.
+void test_unbuffered_recheck_private_lru() {
+#if defined(__linux__)
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr uint64_t GiB = 1ull << 30;
+    detail::HostMemory memory;
+    require(detail::host_available_memory(memory), "could not read available RAM for the file-tier policy test");
+    if (memory.available < 3 * GiB || memory.available > 1024 * GiB || sizeof(size_t) < 8) {
+        std::cout << "file_expert_source_test: private-LRU recheck skipped (needs 3 GiB available and a 64-bit mapping)\n";
+        return;
+    }
+    struct RestoreEnv {
+        bool present;
+        std::string value;
+        RestoreEnv() : present(std::getenv("STRATA_UNBUFFERED_LOAD") != nullptr),
+                       value(present ? std::getenv("STRATA_UNBUFFERED_LOAD") : "") {
+            set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        }
+        ~RestoreEnv() { set_env("STRATA_UNBUFFERED_LOAD", present ? value.c_str() : nullptr); }
+    } restore_env;
+    const int64_t experts = (int64_t) ((2 * memory.available + 8 * GiB + BLOB - 1) / BLOB);
+    const uint64_t bytes = (uint64_t) experts * BLOB;
+    TempDirectory dir(fs::current_path());
+    create_pack(dir.path, bytes);
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, experts, err), "could not load policy-test layout: " + err);
+    FileExpertSource source;
+    require(source.open(dir.path.string(), 1, experts, err), "could not map policy-test pack: " + err);
+    source.set_stage_keep(GiB);
+    std::string why;
+    if (!source.set_unbuffered(0, why)) {
+        // As in test_unbuffered_reads: a filesystem without O_DIRECT cannot exercise this path.
+        require(why.find("cannot open") != std::string::npos, "private LRU selected buffered reads at startup: " + why);
+        std::cout << "file_expert_source_test: private-LRU recheck skipped (" << why << ")\n";
+        return;
+    }
+    bool unbuffered = source.recheck_unbuffered(why);
+    require(unbuffered && source.unbuffered(),
+            "the resident-copy recheck discarded the private-LRU policy: " + why);
+    source.set_stage_keep(0);
+    unbuffered = source.recheck_unbuffered(why);
+    require(!unbuffered && !source.unbuffered(),
+            "the file cache was not restored when no private LRU was budgeted: " + why);
+    source.set_stage_keep(GiB);
+    unbuffered = source.recheck_unbuffered(why);
+    require(unbuffered && source.unbuffered(),
+            "the private-LRU recheck did not reopen unbuffered reads: " + why);
+    std::cout << "private-LRU file-tier policy: startup and recheck PASS\n";
 #endif
 }
 
@@ -925,6 +992,202 @@ void test_rotating_source(bool rotate, bool pin) {
     require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
 }
 
+// RAM adaptation promotes an already staged expert with exact bytes and no
+// additional file reads, including after a GPU exchange changed ownership.
+void test_replace_resident(bool pin, bool private_lru = true) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
+#else
+    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
+#endif
+    const char* old_unbuffered = std::getenv("STRATA_UNBUFFERED_LOAD");
+    const bool had_unbuffered = old_unbuffered != nullptr;
+    const std::string saved_unbuffered = old_unbuffered ? old_unbuffered : "";
+#if defined(_WIN32)
+    _putenv_s("STRATA_UNBUFFERED_LOAD", "1");
+#else
+    setenv("STRATA_UNBUFFERED_LOAD", "1", 1);
+#endif
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t)BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*)truth[e].data(), (std::streamsize)bytes);
+        }
+        require((bool)out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    src.set_stage_keep(private_lru ? 2 * bytes : 0);
+    std::string why;
+    require(src.set_unbuffered(2 * bytes, why) && src.unbuffered(), "unbuffered stage fixture: " + why);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    // experts 2 and 3 are in VRAM, the RAM budget holds 0 and 1, expert 4 stays on the file tier
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(1, err), err);
+    require(src.has_resident(0, 0) && src.has_resident(0, 1) && !src.has_resident(0, 4), "fixture residency wrong");
+    std::vector<uint8_t> actual(bytes);
+    auto holds = [&](int e) {
+        const uint8_t* b = src.blob(0, e);
+        return b != nullptr && !std::memcmp(b, truth[(size_t)e].data(), bytes);
+    };
+    const uint64_t cold_reads = src.file_read_bytes();
+    require(!src.replace_resident(0, 4, 0), "a cold expert triggered a promotion read");
+    require(src.file_read_bytes() == cold_reads && src.has_resident(0, 0) && !src.has_resident(0, 4),
+            "a missed promotion read the file or changed residency");
+    const int64_t incoming = 4;
+    src.begin_layer(0, nullptr, 0);
+    src.prefetch(0, &incoming, 1);
+    require(!src.replace_resident(0, 1, 0), "an expert already in RAM accepted");
+    require(!src.replace_resident(0, 4, 2), "a place the RAM does not hold accepted");
+    require(!src.replace_resident(0, 4, 4) && !src.replace_resident(0, 5, 0) && !src.replace_resident(1, 4, 0),
+            "invalid arguments accepted");
+    require(src.ram_adapts() == 0 && holds(0) && holds(1) && holds(4), "a refused call changed the copy");
+    // a staged exchange owns the tables until it commits
+    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(0), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+            "D2H eviction failed");
+    require(src.stage_exchange(0, 0, 2, 0), "stage rejected");
+    require(!src.replace_resident(0, 4, 1), "accepted beside a staged exchange");
+    require(cache.fill_slot_blocking(0, truth[0].data(), err), err);
+    require(src.commit_exchanges() == 1, "commit count wrong");   // RAM: 2 (in 0's place) and 1; VRAM: 0 and 3
+    const uint8_t* place = src.blob(0, 1);
+    const uint64_t before_promote = src.file_read_bytes();
+    require(src.replace_resident(0, 4, 1), "replace rejected");
+    require(src.file_read_bytes() == before_promote, "a staged promotion performed additional file I/O");
+    require(src.ram_adapts() == 1 && src.has_resident(0, 4) && !src.has_resident(0, 1), "residency wrong");
+    require(src.blob(0, 4) == place && holds(4), "the incoming expert is not in the outgoing one's place");
+    const uint64_t lru_before = src.lru_live_bytes();
+    require(holds(1) && holds(2), "another expert's bytes changed");
+    require(src.copy_blob(0, 1, actual.data()) && actual == truth[1], "the outgoing expert was not preserved in staging");
+    require(src.file_read_bytes() == before_promote && src.lru_live_bytes() == lru_before,
+            "RAM exchange lost the outgoing staged bytes or grew the LRU");
+    require(!src.transient(0, 4), "resident became transient");
+    if (pin) {
+        require(src.pinned(0, 4) && src.device_alias(0, 4), "mapping lost");
+        require(cudaMemcpy(actual.data(), src.device_alias(0, 4), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+                "device alias read failed");
+        require(actual == truth[4], "CUDA alias points at the old expert");
+    }
+    // and back, then an exchange with the VRAM tier still works on the moved place
+    require(src.replace_resident(0, 1, 4) && holds(1) && src.blob(0, 1) == place && !src.has_resident(0, 4),
+            "replace back wrong");
+    require(holds(4) && src.file_read_bytes() == before_promote,
+            "reverse exchange lost staged data or read the disk");
+    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(1), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+            "D2H eviction failed");
+    require(src.stage_exchange(0, 1, 3, 0), "stage after replace rejected");
+    require(cache.fill_slot_blocking(1, truth[1].data(), err), err);
+    require(src.commit_exchanges() == 1 && src.has_resident(0, 3) && holds(3) && !src.has_resident(0, 1),
+            "exchange after replace wrong");
+    require(src.ram_adapts() == 2, "accounting wrong");
+    require(src.stage_keep() == (private_lru ? 2 * bytes : 0), "promotion changed the private LRU budget");
+    src.close();
+    require(src.ram_adapts() == 0, "closing a source retained RAM adaptation accounting");
+#if defined(_WIN32)
+    _putenv_s("STRATA_UNBUFFERED_LOAD", saved_unbuffered.c_str());
+#else
+    if (had_unbuffered) setenv("STRATA_UNBUFFERED_LOAD", saved_unbuffered.c_str(), 1);
+    else unsetenv("STRATA_UNBUFFERED_LOAD");
+#endif
+    std::cout << "replace_resident: pinned=" << pin << " private_lru=" << private_lru << " exact_bytes=PASS\n";
+}
+
+// Exercise the mapped three-role GGUF path, not only experts.bin/O_DIRECT.
+void test_buffered_replace_resident(bool pin) {
+#if defined(STRATA_NATIVE_EXPERTS)
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir;
+    std::string err;
+    NativeFmt fmt;
+    require(native_fmt(GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, H, FF, fmt, err), err);
+    constexpr int experts = 3;
+    const size_t bytes = fmt.bytes;
+    const size_t starts[3] = {0, fmt.up_off, fmt.down_off};
+    const size_t lengths[3] = {fmt.up_off, fmt.down_off - fmt.up_off, bytes - fmt.down_off};
+    std::vector<std::vector<uint8_t>> truth(experts, std::vector<uint8_t>(bytes));
+    for (int e = 0; e < experts; ++e)
+        for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
+    auto ctx = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        ggml_init({experts * bytes + (1ull << 20), nullptr, false}), ggml_free);
+    auto meta = std::unique_ptr<gguf_context, decltype(&gguf_free)>(gguf_init_empty(), gguf_free);
+    require(ctx && meta, "cannot allocate buffered GGUF fixture");
+    const char* roles[3] = {"gate", "up", "down"};
+    for (int r = 0; r < 3; ++r) {
+        ggml_tensor* t = ggml_new_tensor_3d(ctx.get(), (ggml_type)(r < 2 ? fmt.gu_type : fmt.d_type),
+                                           r < 2 ? H : FF, r < 2 ? FF : H, experts);
+        ggml_set_name(t, ("blk.0.ffn_" + std::string(roles[r]) + "_exps.weight").c_str());
+        require(ggml_nbytes(t) == experts * lengths[r], "fixture tensor size mismatch");
+        for (int e = 0; e < experts; ++e)
+            std::memcpy((uint8_t*)t->data + e * lengths[r], truth[e].data() + starts[r], lengths[r]);
+        gguf_add_tensor(meta.get(), t);
+    }
+    const fs::path model = dir.path / "fixture.gguf";
+    require(gguf_write_to_file(meta.get(), model.string().c_str(), false), "cannot write GGUF fixture");
+    {
+        std::ofstream layout(dir.path / "native_experts.txt");
+        layout << "0 " << fmt.gu_type << ' ' << fmt.d_type << " 0 " << bytes;
+        for (int r = 0; r < 3; ++r)
+            layout << ' ' << gguf_get_meta_size(meta.get()) + gguf_get_tensor_offset(meta.get(), r);
+        layout << '\n';
+        require((bool)layout, "cannot write buffered fixture layout");
+    }
+    require(expert_layout_load(dir.path.string(), 1, experts, err), err);
+    FileExpertSource src;
+    src.set_gguf(model.string());
+    require(src.open(dir.path.string(), 1, experts, err) && !src.unbuffered(), err);
+    src.set_stage_keep(0);
+    ExpertCache cache;
+    require(cache.open(1, 1, experts, (int64_t)bytes, err), err);
+    require(cache.admit(0, 2) == 0 && cache.fill_slot_blocking(0, truth[2].data(), err), err);
+    const std::vector<std::pair<int32_t,int32_t>> rank{{0,0},{0,1},{0,2}};
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, bytes, &rank), err);
+    require(src.has_resident(0,0) && !src.has_resident(0,1), "buffered fixture RAM residency wrong");
+    const uint64_t before_cold = src.file_read_bytes();
+    require(!src.replace_resident(0,1,0) && src.file_read_bytes() == before_cold,
+            "buffered cold promotion performed I/O");
+    const int64_t incoming = 1;
+    const int32_t routed = 1;
+    src.begin_layer(0, &routed, 1);
+    src.prefetch(0, &incoming, 1);
+    const uint64_t before = src.file_read_bytes();
+    const uint8_t* place = src.blob(0,0);
+    require(src.replace_resident(0,1,0), "buffered stage promotion refused");
+    require(src.blob(0,1) == place && std::memcmp(place, truth[1].data(), bytes) == 0,
+            "buffered promotion changed expert bytes or RAM slot address");
+    std::vector<uint8_t> actual(bytes);
+    require(src.copy_blob(0,0,actual.data()) && actual == truth[0], "buffered outgoing bytes lost");
+    require(src.replace_resident(0,0,1), "buffered reverse promotion refused");
+    require(src.blob(0,0) == place && std::memcmp(place, truth[0].data(), bytes) == 0,
+            "buffered reverse promotion changed RAM bytes");
+    require(src.copy_blob(0,1,actual.data()) && actual == truth[1], "buffered reverse outgoing bytes lost");
+    require(src.file_read_bytes() == before && src.stage_keep() == 0,
+            "buffered promotion added file reads or a private LRU");
+    if (pin) {
+        require(src.device_alias(0,0) != nullptr &&
+                cudaMemcpy(actual.data(),src.device_alias(0,0),bytes,cudaMemcpyDeviceToHost) == cudaSuccess &&
+                actual == truth[0], "buffered CUDA alias changed bytes");
+    }
+    require(src.copy_blob(0,2,actual.data()) && actual == truth[2], "neighbor expert changed after file advice");
+    std::cout << "buffered_replace_resident: pinned=" << pin << " private_lru=0 exact_bytes=PASS\n";
+#else
+    (void)pin;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -939,6 +1202,7 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_unbuffered_recheck_private_lru();
         test_decode_lru();
         if (argc == 2 && std::string(argv[1]) == "--lru-elastic") test_elastic_lru();
         test_io_prefetch();
@@ -949,6 +1213,12 @@ int main(int argc, char** argv) {
             test_rotating_source(false, true);
             test_rotating_source(true, true);
             test_rotating_source(true, false);
+            test_replace_resident(true);
+            test_replace_resident(false);
+            test_replace_resident(true, false);
+            test_replace_resident(false, false);
+            test_buffered_replace_resident(true);
+            test_buffered_replace_resident(false);
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
