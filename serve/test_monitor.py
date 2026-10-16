@@ -177,7 +177,13 @@ class Monitor(unittest.TestCase):
             release.set()
             self.assertEqual(first.result()[0], 200)
             self.assertEqual(second.result()[0], 200)
+        # The client can read Content-Length bytes before the handler's finally
+        # publishes finished_at, especially while the compiler saturates CPUs.
+        deadline = time.monotonic() + 2
+        while any("finished_at" not in r for r in self.svc.api_requests) and time.monotonic() < deadline:
+            time.sleep(0.005)
         records = list(self.svc.api_requests)
+        self.assertTrue(all("finished_at" in r for r in records))
         self.assertGreater(records[0]["load_s"], 0.02)
         self.assertGreater(records[1]["queue_s"], 0.02)
         self.assertLess(records[1]["load_s"], records[0]["load_s"])

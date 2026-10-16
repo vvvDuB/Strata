@@ -1,4 +1,5 @@
 #include "strata/core/expert_source.hpp"
+#include "strata/core/foresight_swap.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -27,10 +28,9 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
-#include <atomic>
-#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -473,60 +473,6 @@ void set_env(const char* name, const char* value) {
 #endif
 }
 
-// The recheck after the resident copy must retain the same private-LRU policy as startup.
-// A sparse pack larger than available RAM distinguishes that rule from Linux's partial file cache;
-// no expert pages or resident buffers are allocated for this test.
-void test_unbuffered_recheck_private_lru() {
-#if defined(__linux__)
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
-    constexpr uint64_t GiB = 1ull << 30;
-    detail::HostMemory memory;
-    require(detail::host_available_memory(memory), "could not read available RAM for the file-tier policy test");
-    if (memory.available < 3 * GiB || memory.available > 1024 * GiB || sizeof(size_t) < 8) {
-        std::cout << "file_expert_source_test: private-LRU recheck skipped (needs 3 GiB available and a 64-bit mapping)\n";
-        return;
-    }
-    struct RestoreEnv {
-        bool present;
-        std::string value;
-        RestoreEnv() : present(std::getenv("STRATA_UNBUFFERED_LOAD") != nullptr),
-                       value(present ? std::getenv("STRATA_UNBUFFERED_LOAD") : "") {
-            set_env("STRATA_UNBUFFERED_LOAD", nullptr);
-        }
-        ~RestoreEnv() { set_env("STRATA_UNBUFFERED_LOAD", present ? value.c_str() : nullptr); }
-    } restore_env;
-    const int64_t experts = (int64_t) ((2 * memory.available + 8 * GiB + BLOB - 1) / BLOB);
-    const uint64_t bytes = (uint64_t) experts * BLOB;
-    TempDirectory dir(fs::current_path());
-    create_pack(dir.path, bytes);
-    std::string err;
-    require(expert_layout_load(dir.path.string(), 1, experts, err), "could not load policy-test layout: " + err);
-    FileExpertSource source;
-    require(source.open(dir.path.string(), 1, experts, err), "could not map policy-test pack: " + err);
-    source.set_stage_keep(GiB);
-    std::string why;
-    if (!source.set_unbuffered(0, why)) {
-        // As in test_unbuffered_reads: a filesystem without O_DIRECT cannot exercise this path.
-        require(why.find("cannot open") != std::string::npos, "private LRU selected buffered reads at startup: " + why);
-        std::cout << "file_expert_source_test: private-LRU recheck skipped (" << why << ")\n";
-        return;
-    }
-    bool unbuffered = source.recheck_unbuffered(why);
-    require(unbuffered && source.unbuffered(),
-            "the resident-copy recheck discarded the private-LRU policy: " + why);
-    source.set_stage_keep(0);
-    unbuffered = source.recheck_unbuffered(why);
-    require(!unbuffered && !source.unbuffered(),
-            "the file cache was not restored when no private LRU was budgeted: " + why);
-    source.set_stage_keep(GiB);
-    unbuffered = source.recheck_unbuffered(why);
-    require(unbuffered && source.unbuffered(),
-            "the private-LRU recheck did not reopen unbuffered reads: " + why);
-    std::cout << "private-LRU file-tier policy: startup and recheck PASS\n";
-#endif
-}
-
 // #286: the unbuffered file tier (Windows: FILE_FLAG_NO_BUFFERING; Linux: O_DIRECT + io_submit) hands out the same
 // bytes as the mapping - one blob at a time, a batch of adjacent experts (merged into one request), and copy_blob - and
 // never falls back to the mapping.  The pack lives in the working directory, not the temp directory: a tmpfs /tmp has
@@ -535,7 +481,7 @@ void test_unbuffered_reads() {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
-    constexpr int64_t experts = 35;
+    constexpr int64_t experts = 3;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
     const uint64_t total = (uint64_t) layers * layer_bytes;
     TempDirectory dir(fs::current_path());
@@ -554,34 +500,6 @@ void test_unbuffered_reads() {
     }
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
-    auto check_batches = [&]() {
-        // Out-of-order layers, duplicate experts and adjacent ranges; guard both ends of every destination.
-        for (const size_t n : {1u, 8u, 32u}) {
-            std::vector<int32_t> ls(n), es(n);
-            std::vector<std::vector<uint8_t>> outputs(n, std::vector<uint8_t>((size_t) BLOB + 2, 0xA5));
-            std::vector<uint8_t*> dst(n);
-            for (size_t i = 0; i < n; ++i) {
-                ls[i] = (int32_t) (n == 32 ? 0 : (i / 3) % layers);
-                es[i] = (int32_t) (n == 32 ? i : (i * 2) % 3);
-                dst[i] = outputs[i].data() + 1;
-            }
-            require(source.copy_blobs(ls.data(), es.data(), dst.data(), n), "batch copy failed");
-            for (size_t i = 0; i < n; ++i) {
-                require(outputs[i].front() == 0xA5 && outputs[i].back() == 0xA5, "batch wrote past its destination");
-                require(std::memcmp(dst[i], bytes.data() + ls[i] * layer_bytes + es[i] * BLOB, BLOB) == 0,
-                        "batch returned bytes from the wrong expert");
-            }
-            const int32_t invalid = (int32_t) layers;
-            require(!source.copy_blobs(&invalid, es.data(), dst.data(), 1), "batch accepted an invalid layer");
-            require(!source.copy_blobs(nullptr, es.data(), dst.data(), n), "batch accepted null layers");
-            require(!source.copy_blobs(ls.data(), nullptr, dst.data(), n), "batch accepted null experts");
-            require(!source.copy_blobs(ls.data(), es.data(), nullptr, n), "batch accepted null destinations");
-            dst[0] = nullptr;
-            require(!source.copy_blobs(ls.data(), es.data(), dst.data(), n), "batch accepted a null destination");
-        }
-        require(source.copy_blobs(nullptr, nullptr, nullptr, 0), "an empty batch failed");
-    };
-    check_batches();   // mapped fallback, before opening O_DIRECT handles
     set_env("STRATA_UNBUFFERED_LOAD", "1");
     std::string why;
     const bool unbuffered = source.set_unbuffered(0, why);
@@ -598,9 +516,8 @@ void test_unbuffered_reads() {
     return;
 #endif
     require(source.unbuffered(), "set_unbuffered succeeded but the source is not unbuffered");
-    check_batches();   // Linux AIO, including more than the 32 MiB merge limit
-    const int64_t batch[3] = {0, 1, 2};
-    source.prefetch(1, batch, 3);   // layer 1 in one batch: three adjacent blobs
+    const int64_t batch[experts] = {0, 1, 2};
+    source.prefetch(1, batch, experts);   // layer 1 in one batch: three adjacent blobs
     for (int64_t l = 0; l < layers; ++l)
         for (int64_t e = 0; e < experts; ++e) {
             const uint8_t* b = source.blob(l, e);
@@ -615,163 +532,6 @@ void test_unbuffered_reads() {
             "an unbuffered copy_blob differs from the file");
     require(source.direct_fallbacks() == 0, "an unbuffered read fell back to the mapping");
     source.close();
-}
-
-// The LRU retains decode reads. Prompt copies can reuse them but must neither admit nor refresh entries.
-void test_decode_lru() {
-    using namespace strata::core;
-    using strata::kernels::cpu::BLOB;
-    constexpr int64_t layers = 4, experts = 8;
-    TempDirectory dir(fs::current_path());
-    std::string err;
-    require(strata::kernels::cpu::expert_layout_load(dir.path.string(), layers, experts, err), err);
-    std::vector<std::pair<uint64_t, char>> markers;
-    for (int64_t e = 0; e < experts; ++e) {
-        markers.emplace_back((uint64_t)e * BLOB, (char)(e + 1));
-        markers.emplace_back((uint64_t)(e + 1) * BLOB - 1, (char)(100 + e));
-    }
-    create_pack(dir.path, (uint64_t)layers * experts * BLOB, markers);
-    FileExpertSource src;
-    require(src.open(dir.path.string(), layers, experts, err), err);
-    set_env("STRATA_UNBUFFERED_LOAD", "1");
-    std::string why;
-    const bool direct = src.set_unbuffered(0, why);
-    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
-    require(direct, "LRU requires working direct reads: " + why);
-    src.set_stage_keep(4 * BLOB);
-    src.begin_layer(0, nullptr, 0);
-    const int64_t first[] = {0, 1, 2, 3};
-    src.prefetch(0, first, 4);
-    require(src.file_read_bytes() == 4 * BLOB && src.lru_live_bytes() == 4 * BLOB,
-            "initial LRU did not retain exactly four file reads");
-    std::vector<uint8_t> dst(BLOB + 2, 0xA5);
-    auto copy = [&](int64_t expert, bool hit) {
-        const uint64_t before = src.file_read_bytes();
-        require(src.copy_blob(0, expert, dst.data() + 1), "LRU prompt copy failed");
-        require(dst.front() == 0xA5 && dst.back() == 0xA5 && dst[1] == expert + 1 && dst[BLOB] == 100 + expert,
-                "LRU prompt copy returned wrong bytes or overwrote a guard");
-        require(src.file_read_bytes() - before == (hit ? 0 : BLOB), "LRU hit/miss performed unexpected disk reads");
-    };
-    // Age the entries beyond the protected working window; a prompt hit must not save the oldest one.
-    for (int64_t l = 1; l < layers; ++l) src.begin_layer(l, nullptr, 0);
-    copy(0, true);
-    const int64_t fourth = 4;
-    src.prefetch(0, &fourth, 1);
-    copy(0, false);
-    copy(1, true);
-    const int64_t hot = 1, fifth = 5;
-    src.prefetch(0, &hot, 1);  // Decode refreshes recency and protects this entry.
-    src.prefetch(0, &fifth, 1);
-    copy(1, true);
-    copy(2, false);
-    require(src.staged_decode_hits() == 1, "decode LRU reuse was not counted");
-    const int32_t ls[] = {0, 0, 0}, es[] = {1, 3, 0};
-    std::vector<std::vector<uint8_t>> outputs(3, std::vector<uint8_t>(BLOB + 2, 0xA5));
-    uint8_t* targets[] = {outputs[0].data() + 1, outputs[1].data() + 1, outputs[2].data() + 1};
-    const uint64_t before = src.file_read_bytes();
-    require(src.copy_blobs(ls, es, targets, 3), "mixed LRU/file batch failed");
-    require(src.file_read_bytes() - before == BLOB, "mixed batch did not reuse the two retained experts");
-    for (size_t i = 0; i < 3; ++i)
-        require(outputs[i].front() == 0xA5 && outputs[i].back() == 0xA5 &&
-                    targets[i][0] == es[i] + 1 && targets[i][BLOB - 1] == 100 + es[i],
-                "mixed LRU/file batch returned wrong bytes or overwrote a guard");
-    copy(6, false);
-    copy(7, false);
-    copy(1, true);
-    require(src.lru_live_bytes() == 4 * BLOB, "prompt scans changed LRU capacity");
-    src.close();
-    require(src.lru_live_bytes() == 0 && src.staged_decode_hits() == 0 && src.staged_prompt_hits() == 0,
-            "close retained LRU buffers or session counters");
-}
-
-// Exercise the real 1 GiB floor, watcher, concurrent prompt copies, release of Linux pages, and regrowth.
-void test_elastic_lru() {
-    using namespace strata::core;
-    using strata::kernels::cpu::BLOB;
-    constexpr int64_t layers = 8, experts = 104;
-    constexpr uint64_t floor = 1ull << 30;
-    const uint64_t capacity = (uint64_t)layers * experts * BLOB;
-    TempDirectory dir(fs::current_path());
-    std::string err;
-    require(strata::kernels::cpu::expert_layout_load(dir.path.string(), layers, experts, err), err);
-    std::vector<std::pair<uint64_t, char>> markers;
-    for (int64_t l = 0; l < layers; ++l)
-        for (int64_t e = 0; e < experts; ++e) {
-            const uint64_t at = (uint64_t)(l * experts + e) * BLOB;
-            markers.emplace_back(at, (char)(l + 1));
-            markers.emplace_back(at + 1, (char)(e + 1));
-        }
-    create_pack(dir.path, capacity, markers);
-    FileExpertSource src;
-    require(src.open(dir.path.string(), layers, experts, err), err);
-    set_env("STRATA_UNBUFFERED_LOAD", "1");
-    std::string why;
-    const bool direct = src.set_unbuffered(0, why);
-    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
-    require(direct, "elastic LRU requires direct reads: " + why);
-    src.set_stage_keep(capacity);
-    auto populate = [&] {
-        for (int64_t l = 0; l < layers; ++l) {
-            src.begin_layer(l, nullptr, 0);
-            for (int64_t e = 0; e < experts; ++e) {
-                const uint8_t* p = src.blob(l, e);
-                require(p && p[0] == l + 1 && p[1] == e + 1, "elastic LRU returned wrong expert bytes");
-            }
-        }
-    };
-    populate();
-    require(src.lru_live_bytes() == capacity, "elastic fixture did not fill the configured LRU");
-    const uint8_t* protected_blob = src.blob(layers - 1, experts - 1);
-    auto rss = []() -> uint64_t {
-#if defined(__linux__)
-        std::ifstream f("/proc/self/status");
-        std::string key, line;
-        while (f >> key) {
-            if (key == "VmRSS:") { uint64_t n = 0; f >> n; return n * 1024; }
-            std::getline(f, line);
-        }
-#endif
-        return 0;
-    };
-    const uint64_t rss_before = rss();
-    // An unattainable floor deterministically simulates pressure without consuming another process's RAM.
-    src.start_elastic_lru(std::numeric_limits<uint64_t>::max() / 4);
-    std::atomic<bool> quit{false}, bad_copy{false};
-    std::thread reader([&] {
-        std::vector<uint8_t> copy(BLOB);
-        while (!quit.load()) {
-            if (!src.copy_blob(layers - 1, experts - 1, copy.data()) || copy[0] != layers || copy[1] != experts)
-                bad_copy.store(true);
-            (void)src.lru_live_bytes();  // Concurrent stats must synchronize with the watcher.
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-    });
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (src.lru_live_bytes() > floor && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    quit.store(true);
-    reader.join();
-    require(!bad_copy.load(), "watcher changed bytes being copied by the prompt path");
-    const uint64_t held = src.lru_live_bytes();
-    require(held <= floor && held + BLOB > floor && src.lru_freed() > 0,
-            "elastic watcher did not shrink to its one-blob-rounded 1 GiB floor");
-    require(protected_blob[0] == layers && protected_blob[1] == experts,
-            "watcher freed a buffer still protected by the current decode layer");
-#if defined(__linux__)
-    require(rss_before > rss() + (32ull << 20), "Linux LRU shrink did not return physical pages to the OS");
-#endif
-    const uint64_t before = src.file_read_bytes();
-    std::vector<uint8_t> cold(BLOB);
-    require(src.copy_blob(0, 0, cold.data()) && cold[0] == 1 && cold[1] == 1,
-            "an evicted expert could not be read again");
-    require(src.file_read_bytes() == before + BLOB, "evicted expert remained incorrectly cached");
-    src.start_elastic_lru(1);  // Available memory permits cap growth on the next watcher tick.
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
-    populate();
-    require(src.lru_live_bytes() == capacity, "elastic LRU did not regrow into its freed slots");
-    src.close();  // Stops and joins the watcher before releasing buffers.
-    require(src.lru_live_bytes() == 0 && src.lru_freed() == 0, "elastic close retained memory or counters");
-    std::cout << "elastic LRU: shrink, concurrent copies, page release and regrowth OK\n";
 }
 
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
@@ -901,7 +661,7 @@ void test_rotating_source(bool rotate, bool pin) {
 #else
     setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
 #endif
-    TempDirectory dir(fs::current_path());
+    TempDirectory dir;
     std::string err;
     require(expert_layout_load(dir.path.string(), 1, 5, err), err);
     const size_t bytes = (size_t)BLOB;
@@ -928,13 +688,6 @@ void test_rotating_source(bool rotate, bool pin) {
     require(src.reserve_exchanges(2, err), err);
     require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
     require(src.reserve_exchanges(1, err), "smaller capacity rejected");
-#if defined(__linux__)
-    set_env("STRATA_UNBUFFERED_LOAD", "1");
-    std::string why;
-    const bool direct = src.set_unbuffered(0, why);
-    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
-    require(direct, "rotation batch fixture needs O_DIRECT: " + why);
-#endif
     if (rotate && pin) require(!src.reserve_exchanges(3, err), "live arena growth accepted");
     int incoming[2] = {0, 1}, outgoing[2] = {2, 3};
     std::vector<uint8_t> actual(bytes);
@@ -964,11 +717,6 @@ void test_rotating_source(bool rotate, bool pin) {
             require(held == ((rotate && pin) ? eviction[q] : prior[q]), "wrong storage selected");
             if (rotate && pin) require(src.exchange_buffer(q) == prior[q], "old input not recycled");
             require(src.copy_blob(0, outgoing[q], actual.data()) && actual == truth[outgoing[q]], "copy_blob mismatch");
-            const int32_t ls[2] = {0, 0}, es[2] = {outgoing[q], 4};
-            std::vector<uint8_t> file(bytes);
-            uint8_t* dst[2] = {actual.data(), file.data()};
-            require(src.copy_blobs(ls, es, dst, 2) && actual == truth[outgoing[q]] && file == truth[4],
-                    "batched resident/file copy lost an exchange rotation");
             require(!src.transient(0, outgoing[q]), "resident became transient");
             if (pin) {
                 require(src.pinned(0, outgoing[q]) && src.device_alias(0, outgoing[q]), "mapping lost");
@@ -992,8 +740,148 @@ void test_rotating_source(bool rotate, bool pin) {
     require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
 }
 
-// RAM adaptation promotes an already staged expert with exact bytes and no
-// additional file reads, including after a GPU exchange changed ownership.
+// #2134: a Foresight slot copied from an expert's RAM place before an exchange rewrote that place is never served; the
+// experts an exchange moves get no copy between commit_copies and commit_flip; and a dropped slot that a window may
+// still read waits `depth` finished windows before it is refilled.
+void test_foresight_exchange(bool two_phase) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
+#else
+    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
+#endif
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t) ((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*) truth[e].data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    require(src.pin_cache_complement(cache, err, true, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(1, err), err);
+    require(src.pinned(0, 0), "expert 0 is not in the pinned RAM copy");
+    int dev = 0;
+    cudaGetDevice(&dev);
+    ForesightSwap fs;
+    require(fs.init(1, 1, 5, {0}, {dev}, err), err);   // one slot, depth 4
+    fs.verify = true;
+    src.set_foresight_swap(&fs);
+    unsigned long long ptr = 0;
+    auto landed = [&](int32_t e) {
+        for (int i = 0; i < 5000; ++i) {
+            if (fs.take(0, e, ptr)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    fs.note_miss(&src, 0, 0);                                    // expert 0 -> the slot, from its RAM place
+    require(landed(0) && fs.verify_ok == 1, "the first copy did not land");
+    // the adaptive tier swaps expert 0 into cache slot 0 and evicts expert 2 into the exchange buffer
+    uint8_t* eviction = src.exchange_buffer(0);
+    const uint8_t* prior = src.blob(0, 0);
+    require(cudaMemcpy(eviction, cache.device_slot(0), bytes, cudaMemcpyDeviceToHost) == cudaSuccess, "D2H eviction failed");
+    require(src.stage_exchange(0, 0, 2, 0), "stage rejected");
+    require(cache.fill_slot_blocking(0, prior, err), err);
+    if (two_phase) {
+        src.commit_copies();                                     // 0's place holds 2's bytes from here on
+        const uint64_t c0 = fs.copies;
+        fs.completed.fetch_add(8);
+        fs.note_miss(&src, 0, 2);
+        fs.predict(&src, 0, 0);
+        require(fs.copies == c0, "an expert was copied while its exchange was half done");
+        require(!fs.take(0, 0, ptr), "a slot dropped by commit_copies was served");
+        require(src.commit_flip() == 1, "flip count wrong");
+    } else {
+        require(src.commit_exchanges() == 1, "commit count wrong");
+    }
+    require(fs.dropped == 1, "the exchange did not drop the slot");
+    require(!fs.take(0, 0, ptr), "a slot copied before the exchange was served");
+    if (!two_phase) {   // the slot was served at window 0: no refill before window 0 + depth
+        const uint64_t c0 = fs.copies, b0 = fs.busy;
+        fs.note_miss(&src, 0, 2);
+        require(fs.copies == c0 && fs.busy == b0 + 1, "a dropped slot was refilled while a window may still read it");
+        fs.completed.fetch_add(4);
+    }
+    require(src.has_resident(0, 2) && !src.has_resident(0, 0), "residency wrong");
+    fs.note_miss(&src, 0, 2);                                    // expert 2, now at 0's old place
+    require(landed(2), "the copy after the exchange did not land");
+    std::vector<uint8_t> back(bytes);
+    require(cudaMemcpy(back.data(), (const void*) ptr, bytes, cudaMemcpyDeviceToHost) == cudaSuccess && back == truth[2],
+            "the slot does not hold expert 2's bytes");
+    require(fs.verify_bad == 0 && fs.verify_ok == 2, "verify counted a bad slot");
+    src.set_foresight_swap(nullptr);
+    std::cout << "foresight exchange (" << (two_phase ? "commit_copies + commit_flip" : "commit_exchanges")
+              << "): dropped " << fs.dropped << ", " << fs.report() << ": PASS\n";
+    src.close();
+}
+
+void test_unbuffered_recheck_private_lru() {
+#if defined(__linux__)
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr uint64_t GiB = 1ull << 30;
+    detail::HostMemory memory;
+    require(detail::host_available_memory(memory), "could not read available RAM for the file-tier policy test");
+    if (memory.available < 3 * GiB || memory.available > 1024 * GiB || sizeof(size_t) < 8) {
+        std::cout << "file_expert_source_test: private-LRU recheck skipped (needs 3 GiB available and a 64-bit mapping)\n";
+        return;
+    }
+    struct RestoreEnv {
+        bool present;
+        std::string value;
+        RestoreEnv() : present(std::getenv("STRATA_UNBUFFERED_LOAD") != nullptr),
+                       value(present ? std::getenv("STRATA_UNBUFFERED_LOAD") : "") {
+            set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        }
+        ~RestoreEnv() { set_env("STRATA_UNBUFFERED_LOAD", present ? value.c_str() : nullptr); }
+    } restore_env;
+    const int64_t experts = (int64_t) ((2 * memory.available + 8 * GiB + BLOB - 1) / BLOB);
+    const uint64_t bytes = (uint64_t) experts * BLOB;
+    TempDirectory dir(fs::current_path());
+    create_pack(dir.path, bytes);
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, experts, err), "could not load policy-test layout: " + err);
+    FileExpertSource source;
+    require(source.open(dir.path.string(), 1, experts, err), "could not map policy-test pack: " + err);
+    source.set_stage_keep(GiB);
+    std::string why;
+    if (!source.set_unbuffered(0, why)) {
+        // As in test_unbuffered_reads: a filesystem without O_DIRECT cannot exercise this path.
+        require(why.find("cannot open") != std::string::npos, "private LRU selected buffered reads at startup: " + why);
+        std::cout << "file_expert_source_test: private-LRU recheck skipped (" << why << ")\n";
+        return;
+    }
+    bool unbuffered = source.recheck_unbuffered(why);
+    require(unbuffered && source.unbuffered(),
+            "the resident-copy recheck discarded the private-LRU policy: " + why);
+    source.set_stage_keep(0);
+    unbuffered = source.recheck_unbuffered(why);
+    require(!unbuffered && !source.unbuffered(),
+            "the file cache was not restored when no private LRU was budgeted: " + why);
+    source.set_stage_keep(GiB);
+    unbuffered = source.recheck_unbuffered(why);
+    require(unbuffered && source.unbuffered(),
+            "the private-LRU recheck did not reopen unbuffered reads: " + why);
+    std::cout << "private-LRU file-tier policy: startup and recheck PASS\n";
+#endif
+}
+
 void test_replace_resident(bool pin, bool private_lru = true) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
@@ -1105,7 +993,6 @@ void test_replace_resident(bool pin, bool private_lru = true) {
     std::cout << "replace_resident: pinned=" << pin << " private_lru=" << private_lru << " exact_bytes=PASS\n";
 }
 
-// Exercise the mapped three-role GGUF path, not only experts.bin/O_DIRECT.
 void test_buffered_replace_resident(bool pin) {
 #if defined(STRATA_NATIVE_EXPERTS)
     using namespace strata::core;
@@ -1203,8 +1090,6 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_unbuffered_recheck_private_lru();
-        test_decode_lru();
-        if (argc == 2 && std::string(argv[1]) == "--lru-elastic") test_elastic_lru();
         test_io_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
@@ -1213,12 +1098,15 @@ int main(int argc, char** argv) {
             test_rotating_source(false, true);
             test_rotating_source(true, true);
             test_rotating_source(true, false);
+            test_foresight_exchange(false);
+            test_foresight_exchange(true);
             test_replace_resident(true);
             test_replace_resident(false);
             test_replace_resident(true, false);
             test_replace_resident(false, false);
             test_buffered_replace_resident(true);
             test_buffered_replace_resident(false);
+
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;

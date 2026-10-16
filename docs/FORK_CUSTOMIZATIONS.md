@@ -1,6 +1,6 @@
-# Current integration: 0.1.43 stable
+# Current integration: 0.1.44 stable
 
-The owner fork integrates official `v0.1.43.1` (`a0116b2782a5b82622358c04a06496485d12b2d6`), retaining NVFP4 KV, elastic GPU and RAM caches, exact checkpoints, on-demand vision, automatic Pi compaction, cancellation and the direct server CLI. The fork version and stable release title are **0.1.43**. Conservative resident-RAM maintenance is opt-in. See [UPSTREAM_0_1_43.md](UPSTREAM_0_1_43.md) for integration decisions and validation. The older sections below are historical.
+The owner fork integrates official `v0.1.44.1` (`296b59d2f73c8f04a805df29c2fa97655adace78`), retaining NVFP4 KV, elastic GPU and RAM caches, exact checkpoints, on-demand vision, automatic Pi compaction, cancellation and the direct server CLI. The fork version and stable release title are **0.1.44**. Conservative resident-RAM maintenance is opt-in. See [UPSTREAM_0_1_44.md](UPSTREAM_0_1_44.md) for integration decisions and validation. The older sections below are historical.
 The fork also supports [vision on demand](VISION_ON_DEMAND.md): an ephemeral
 encoder, disk-cached SVE1 embeddings and temporary GPU expert-cache leases,
 including the resident low-RAM complement. Existing resident vision remains
